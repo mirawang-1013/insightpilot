@@ -1,0 +1,67 @@
+# ============================================================================
+# .gitignore —— 不应入库的文件
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 包管理器缓存 ----
+.pip/
+.uv-cache/
+
+# ---- 密钥和环境变量 ----
+# 绝对不能提交 .env —— 里面有 OPENAI_API_KEY
+.env
+.env.local
+
+# ---- 数据文件（大、不应入库）----
+# Olist 原始 CSV：由 setup_data.py 从 Kaggle 下载
+data/olist/*.csv
+
+# DuckDB 数据仓库：由 setup_data.py 构建
+data/warehouse.duckdb
+data/*.duckdb
+data/*.duckdb.wal
+
+# ChromaDB 向量索引：由知识库索引脚本生成
+data/knowledge_base/chroma/
+
+# ---- 生成的报告和图表 ----
+outputs/*.md
+outputs/*.png
+outputs/*.html
+!outputs/.gitkeep
+
+# ---- 测试与 lint 缓存 ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+notebooks/**/*.ipynb_checkpoints
+
+# ---- LangGraph SqliteSaver 持久化文件 ----
+*.sqlite
+*.sqlite3
+checkpoints.db
