@@ -1,189 +1,300 @@
 """
-graph.py —— LangGraph StateGraph 定义
+graph.py —— LangGraph StateGraph 定义（Phase 3 升级版）
 
-【Phase 2 的最小图】
-    START → query_node → END
+【Phase 3 拓扑】
+    START
+      ↓
+    [planner]              拆 user_query 成 list[ExecutionStep]
+      ↓
+    [step_router]          看当前 step_index 决定下一步
+      ├─→ [query_node]     如果是 query 步骤
+      ├─→ [analysis_node]  如果是 analysis 步骤
+      └─→ END              所有步骤跑完
 
-    只有一个业务节点，但骨架建好了。
-    Phase 3 起会陆续加节点（Planner / Analysis / Reporter / Reviewer）。
+    query_node / analysis_node 跑完后回到 step_router 判断下一步。
 
-【query_node 的职责】
-    1. 从 AgentState 里拿 user_query
-    2. 包装成 HumanMessage 喂给 Query Agent
-    3. 跑完 Agent 后，把 Agent 的 messages 合并回 State.messages
-    4. 解析 Agent 跑的结果（QueryResult）累积到 State.query_results
+【条件边的核心】
+    add_conditional_edges(from_node, decide_fn, {ret_value: target_node})
 
-【为什么要 query_node 这层包装，不直接让 Agent 当节点？】
-    Query Agent 内部只关心 messages，但 AgentState 有更多字段
-    （query_results / chart_paths / status 等）。
-    query_node 负责"从 Agent 的 messages 里抽取结构化数据，写进 State"。
+    decide_fn 是纯函数，读 state 返回字符串。
+    LangGraph 用字符串到字典里找下一个节点。
+    这是显式状态机的精髓 —— 路由是可测试的代码，不是 LLM 决定。
 
-    这就是之前讲的"graph 层做状态管理，Agent 层做 LLM 循环"的分工。
+【循环计数保护】
+    iteration_count 每次进 step_router 都 +1，超过 max_iterations 强制 END。
+    防止某个 step 反复失败导致死循环。
 """
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from insight_pilot.agents.analysis import build_analysis_agent
+from insight_pilot.agents.planner import build_planner
 from insight_pilot.agents.query import build_query_agent
-from insight_pilot.state import AgentState, QueryResult
+from insight_pilot.state import AgentState, AnalysisResult, QueryResult
 from insight_pilot.tools.duckdb_executor import execute_sql as _execute_sql_core
 
 
 # ============================================================================
-# 节点 1：query_node
+# 节点 1：planner_node
 #
-# 【数据流】
-#   输入：state["user_query"], state["messages"] (可能是空)
-#   输出：{"messages": [...], "query_results": [...], "status": "..."}
-#         LangGraph 会把这个 dict 按字段 reducer 合并进 state
+# 一次 LLM 调用产出 list[ExecutionStep]。
+# 没有循环、没有工具，最简单的节点。
 # ============================================================================
-def query_node(state: AgentState) -> dict:
+def planner_node(state: AgentState) -> dict:
     """
-    Query Agent 节点：把 user_query 喂给 ReAct Agent，返回 SQL + 结果。
+    Planner 节点：拆解 user_query 为执行步骤序列。
     """
-    # 懒构造 Agent（每次调用都构造？后面可以加 lru_cache 优化）
-    agent = build_query_agent()
-
-    # ---- 构造 Agent 的输入 ----
-    # Agent 接受 messages 列表，至少要有一条 HumanMessage
-    user_msg = HumanMessage(content=state["user_query"])
-
-    # ---- 调 Agent ----
-    # 用 invoke 而不是 stream —— 这个节点是同步节点，拿到最终结果再返回
-    # （流式体验让 main.py 控制，不是节点的责任）
-    agent_result = agent.invoke({"messages": [user_msg]})
-
-    # agent_result 是 {"messages": [...]}，包含了整个 ReAct 循环的所有消息：
-    #   HumanMessage → AIMessage(tool_calls=[...]) → ToolMessage → AIMessage → ... → AIMessage(最终答案)
-    all_messages = agent_result["messages"]
-
-    # ---- 从 messages 里抽取本次跑的 SQL 结果 ----
-    # 我们需要找所有 execute_sql 工具调用及其结果
-    # 这里简化：只保留成功的最后一次 SQL 执行的结构化数据
-    #
-    # 【为什么不直接让 execute_sql 工具写 State？】
-    #   @tool 装饰的函数没法访问 LangGraph State（它们是独立函数）。
-    #   只能事后从 messages 里"反推"。Phase 3 有更优雅的做法（Command 对象）。
-    extracted_results = _extract_query_results(all_messages)
+    planner = build_planner()
+    steps = planner(state["user_query"])
 
     return {
-        # 把 Agent 跑的所有消息追加到 State.messages
-        # add_messages reducer 会处理去重和 tool_call 配对
-        "messages": all_messages,
-        # 把提取到的 QueryResult 追加到 State.query_results
-        # operator.add reducer 会做列表拼接
-        "query_results": extracted_results,
-        # 状态更新为"已执行"
+        "execution_plan": steps,
+        "current_step_index": 0,
         "status": "executing",
-        # 循环计数 +1（Phase 2 只有一个节点，不会循环，但预埋字段更新逻辑）
         "iteration_count": state.get("iteration_count", 0) + 1,
     }
 
 
+# ============================================================================
+# 节点 2：query_node
+#
+# 处理一个 query 步骤：用 Query Agent 跑 ReAct 循环，最后产出 QueryResult。
+# 把 description 当作"子任务"喂给 Agent。
+# ============================================================================
+def query_node(state: AgentState) -> dict:
+    """
+    执行当前的 query 步骤。
+    """
+    plan = state["execution_plan"]
+    idx = state["current_step_index"]
+    current_step = plan[idx]
+
+    # ---- 调 Query Agent ----
+    agent = build_query_agent()
+
+    # 把当前 step 的 description 当作子任务喂进去
+    user_msg = HumanMessage(content=f"任务：{current_step.description}")
+    agent_result = agent.invoke({"messages": [user_msg]})
+    all_messages = agent_result["messages"]
+
+    # ---- 从 Agent 跑过的工具调用里抽出 SQL 结果 ----
+    extracted_results = _extract_query_results(all_messages)
+
+    return {
+        "messages": all_messages,
+        "query_results": extracted_results,
+        # current_step_index +1 推进到下一步
+        "current_step_index": idx + 1,
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
+
+
+# ============================================================================
+# 节点 3：analysis_node
+#
+# 处理一个 analysis 步骤：用 Analysis Agent 跑 Python 代码 + 画图。
+# Analysis Agent 是动态构建的（要传 query_results）。
+# ============================================================================
+def analysis_node(state: AgentState) -> dict:
+    """
+    执行当前的 analysis 步骤。
+
+    【为什么用 captures 而不是事后从 messages 重跑？】
+      run_python 工具产生 PNG 文件作为副作用。
+      事后重跑会"覆盖文件"而非"创建新文件"，导致 chart_paths 检测失效。
+      所以在工具调用时直接捕获 AnalysisResult 到 captures 列表。
+    """
+    plan = state["execution_plan"]
+    idx = state["current_step_index"]
+    current_step = plan[idx]
+
+    # ---- 把 State 里累积的 query_results 转 dict 列表 ----
+    query_results_dicts = [qr.to_dict() for qr in state["query_results"]]
+
+    # ---- 在源头捕获结果 ----
+    captures: list[AnalysisResult] = []
+    agent = build_analysis_agent(query_results_dicts, captures=captures)
+
+    # 给 Agent 的任务描述里附上 step_id，让 LLM 知道用哪个 id 命名图表
+    user_msg = HumanMessage(content=(
+        f"任务：{current_step.description}\n"
+        f"step_id：{current_step.step_id}（请用这个数字命名图表文件）"
+    ))
+    agent_result = agent.invoke({"messages": [user_msg]})
+    all_messages = agent_result["messages"]
+
+    # ---- 从 captures 直接拿结果，不需要重跑 ----
+    successful_results = [r for r in captures if r.success]
+    chart_paths: list[str] = []
+    for r in successful_results:
+        chart_paths.extend(r.chart_paths)
+
+    return {
+        "messages": all_messages,
+        "analysis_results": successful_results,
+        "chart_paths": chart_paths,
+        "current_step_index": idx + 1,
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
+
+
+# ============================================================================
+# 路由函数：decide_next_step
+#
+# 【这个函数不是节点 —— 是条件边的判断器】
+#   add_conditional_edges 接受这个函数，根据返回值决定下一个节点。
+#   纯函数：读 state，返回字符串，无副作用。
+#
+# 【返回值的含义】
+#   "query"     → 跑 query_node
+#   "analysis"  → 跑 analysis_node
+#   "done"      → 跳到 END
+# ============================================================================
+def decide_next_step(state: AgentState) -> str:
+    """
+    根据当前 step_index 和 max_iterations 判断下一步去哪。
+    """
+    # ---- 安全闸：超过最大迭代次数强制结束 ----
+    if state["iteration_count"] >= state["max_iterations"]:
+        return "done"
+
+    plan = state.get("execution_plan", [])
+    idx = state.get("current_step_index", 0)
+
+    # ---- 所有步骤跑完了 → END ----
+    if idx >= len(plan):
+        return "done"
+
+    # ---- 看当前 step 的 type ----
+    current_step = plan[idx]
+    if current_step.step_type == "query":
+        return "query"
+    elif current_step.step_type == "analysis":
+        return "analysis"
+    else:
+        # 不应该发生（Pydantic 已经校验过 step_type 是合法 Literal）
+        # 但留个兜底，万一未来加新类型时旧代码不挂
+        return "done"
+
+
+# ============================================================================
+# 辅助：从 Query Agent 的 messages 里抽 QueryResult
+#
+# 跟 Phase 2 版本一致 —— 重新执行成功的 SQL 拿结构化结果。
+# ============================================================================
 def _extract_query_results(messages: list) -> list[QueryResult]:
-    """
-    从 Agent 的完整消息列表里，提取所有成功的 SQL 执行结果。
-
-    【实现策略】
-      遍历所有 ToolMessage，看哪些是 execute_sql 的返回。
-      然后根据前一条 AIMessage 的 tool_call 拿到原始 SQL，
-      重新调用核心 execute_sql 函数拿 QueryResult dataclass。
-
-    【为什么要重新调一次 execute_sql？】
-      因为 @tool 包装返回的是字符串（LLM 看的预览），
-      我们需要原始 QueryResult 结构化数据塞进 State。
-      重新调一次的代价：DuckDB 查询 <100ms，可接受。
-
-      更优的做法会在 Phase 3 讨论（LangGraph 的 Command 机制）。
-    """
+    """从 Agent 的完整消息列表里，提取所有成功的 SQL 执行结果。"""
     results: list[QueryResult] = []
-
-    # 遍历消息对：AIMessage(tool_calls) → ToolMessage(content)
-    # 对每个 execute_sql 的调用，重放一次拿 QueryResult
-    for i, msg in enumerate(messages):
-        # 找 AIMessage 里 tool_calls 包含 execute_sql 的
+    for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tool_call in msg.tool_calls:
                 if tool_call["name"] == "execute_sql":
                     sql = tool_call["args"].get("sql", "")
                     if sql:
-                        # 重新执行拿结构化结果
-                        # 这里不怕重复跑：只读查询，幂等
                         result = _execute_sql_core(sql)
                         if result.success:
                             results.append(result)
-
     return results
 
 
 # ============================================================================
-# 图构造函数：build_graph
+# 图构造：build_graph
 # ============================================================================
 def build_graph() -> CompiledStateGraph:
     """
-    构造 Phase 2 的最小图：START → query → END
+    构造 Phase 3 的多节点图。
 
-    Returns:
-        编译好的 StateGraph，可以 .invoke() 或 .stream() 跑。
+    拓扑：
+      START → planner → step_router → (query | analysis) → step_router → ... → END
     """
-    # ---- 声明 StateGraph ----
-    # 参数 AgentState：告诉 LangGraph 用哪个 TypedDict 作为状态模式
-    # reducer 通过 Annotated 在 AgentState 定义里绑定（如 operator.add）
     builder = StateGraph(AgentState)
 
     # ---- 加节点 ----
-    # 第一个参数是节点名（字符串），第二个是节点函数
-    # 节点函数签名固定：接收 state (dict)，返回 dict（字段更新）
+    builder.add_node("planner", planner_node)
     builder.add_node("query", query_node)
+    builder.add_node("analysis", analysis_node)
 
     # ---- 加边 ----
-    # START → query：图启动后第一个跑 query 节点
-    # query → END：query 完就结束
-    # Phase 3 会在这里加条件边：query → (还有步骤?) → query / END
-    builder.add_edge(START, "query")
-    builder.add_edge("query", END)
+    # 入口：START → planner
+    builder.add_edge(START, "planner")
 
-    # ---- 编译 ----
-    # compile() 把 builder 变成可执行的 CompiledStateGraph
-    # 这一步会做静态校验：
-    #   - 所有节点被 START 可达？
-    #   - 所有节点有出边？
-    #   - 状态字段的 reducer 定义合法？
-    graph = builder.compile()
+    # planner 跑完 → 进入条件路由判断第一步去哪
+    # 注意：我们没把 step_router 写成节点，而是直接用 add_conditional_edges
+    # 把"路由"作为 planner 的出边来表达。这样图里少一个节点，结构更紧凑。
+    builder.add_conditional_edges(
+        "planner",          # 从 planner 出发
+        decide_next_step,   # 调用这个函数判断去哪
+        {
+            "query": "query",
+            "analysis": "analysis",
+            "done": END,
+        },
+    )
 
-    return graph
+    # query 跑完 → 同样进路由（决定下一步是再 query 还是 analysis 还是 END）
+    builder.add_conditional_edges(
+        "query",
+        decide_next_step,
+        {
+            "query": "query",
+            "analysis": "analysis",
+            "done": END,
+        },
+    )
+
+    # analysis 跑完 → 同样进路由
+    builder.add_conditional_edges(
+        "analysis",
+        decide_next_step,
+        {
+            "query": "query",
+            "analysis": "analysis",
+            "done": END,
+        },
+    )
+
+    return builder.compile()
 
 
 # ============================================================================
 # 开发自检
-# 用法：uv run python -m insight_pilot.graph "2017 年月度营收趋势"
 # ============================================================================
 if __name__ == "__main__":
     import sys
     from insight_pilot.state import create_initial_state
 
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "2017 年月度营收趋势"
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
+        "分析各州的配送表现，延迟和评分有什么关系？"
+    )
 
     print(f"问题：{query}\n")
     print("=" * 72)
-    print("构建图 & 运行...\n")
+    print("构建图...")
 
     graph = build_graph()
+
+    print(f"节点：{list(graph.nodes)}")
+    print()
+    print("跑图...\n")
+
     initial_state = create_initial_state(query)
-    final_state = graph.invoke(initial_state)
 
-    print("=" * 72)
-    print("最终 State 摘要：\n")
-    print(f"  iteration_count: {final_state['iteration_count']}")
-    print(f"  query_results 条数: {len(final_state['query_results'])}")
-
-    if final_state["query_results"]:
-        last_result = final_state["query_results"][-1]
-        print(f"\n  最后一条 SQL：\n    {last_result.sql}")
-        print(f"\n  结果预览：")
-        print(last_result.to_llm_string(preview_rows=5))
-
-    print(f"\n  messages 条数: {len(final_state['messages'])}")
+    for event in graph.stream(initial_state, stream_mode="updates"):
+        for node_name, node_update in event.items():
+            print(f"--- 节点完成: {node_name} ---")
+            # 打印关键字段更新
+            if "execution_plan" in node_update:
+                print(f"  [Plan] {len(node_update['execution_plan'])} 步")
+                for s in node_update["execution_plan"]:
+                    print(f"    Step {s.step_id}: [{s.step_type}] {s.description[:80]}")
+            if "query_results" in node_update:
+                print(f"  [+QueryResult] {len(node_update['query_results'])} 条新结果")
+            if "analysis_results" in node_update:
+                print(f"  [+AnalysisResult] {len(node_update['analysis_results'])} 条新结果")
+            if "chart_paths" in node_update:
+                print(f"  [+Charts] {node_update['chart_paths']}")
+            print()

@@ -47,6 +47,10 @@ from insight_pilot.tools.metadata_explorer import (
     list_tables as _list_tables_core,
     sample_rows as _sample_rows_core,
 )
+from insight_pilot.tools.python_sandbox import (
+    SandboxInput,
+    execute_python as _execute_python_core,
+)
 
 
 # ============================================================================
@@ -167,20 +171,101 @@ def execute_sql(sql: str) -> str:
 
 
 # ============================================================================
-# 导出：Query Agent 使用的工具列表
+# Analysis Agent 的工具：run_python（工厂模式）
 #
-# 【为什么集中导出一个列表？】
-#   Phase 2 只有 Query Agent，但 Phase 3 起会有 Analysis Agent、Planner 等。
+# 【为什么不能像 query 那样直接 @tool？】
+#   run_python 需要把 LLM 的 code + 当前 State 里的 query_results 一起送进沙盒。
+#   query_results 是动态的（每次跑图都不一样），不能写死在工具定义里。
+#
+# 【工厂模式：闭包捕获 query_results】
+#   每次构建 Analysis Agent 时，把当前 query_results 传给工厂，
+#   工厂返回一个"已经知道当前 query_results"的工具实例。
+#
+#   这是 LangChain 官方文档里"动态工具"的推荐模式。
+# ============================================================================
+def make_run_python_tool(
+    query_results: list[dict],
+    captures: list | None = None,
+):
+    """
+    工厂函数：返回一个绑定了 query_results 的 run_python 工具。
+
+    Args:
+        query_results: 上游 query 步骤产出的 SQL 结果（QueryResult.to_dict() 列表）。
+        captures: 可选的共享 list。每次工具调用产出的 AnalysisResult 会 append 进去。
+                 graph 层用这个机制"在源头捕获结果"，避免事后重跑沙盒
+                 （重跑会让 chart_paths 检测失效，因为图文件已经存在）。
+
+    Returns:
+        BaseTool 实例，可直接传给 create_react_agent(tools=[...])。
+    """
+
+    @tool
+    def run_python(code: str, step_id: int = 0) -> str:
+        """
+        在隔离的 subprocess 沙盒里执行 Python 代码（pandas + matplotlib 已 import）。
+
+        可用变量（自动注入，不用自己 import / load）：
+          - query_results : list[dict] —— 上游 SQL 步骤的结果
+                            形如 [{"sql": "...", "columns": [...], "rows": [{...}, ...]}, ...]
+          - get_df(i)     : 把 query_results[i]["rows"] 转成 DataFrame 的便捷函数
+          - step_id       : 当前步骤号（命名图表用）
+          - pd            : pandas
+          - plt           : matplotlib.pyplot
+          - matplotlib    : matplotlib（已 use("Agg") 无 GUI 模式）
+
+        画图保存约定：
+          - 用 plt.savefig(f"chart_{step_id}_<name>.png") 命名
+          - cwd 已是 outputs/，相对路径就行
+          - 一定记得 plt.close() 释放内存
+
+        何时使用：
+          - 数据透视、相关性分析（pandas）
+          - 画图（matplotlib）
+          - 生成业务结论文字（用 print）
+
+        Args:
+            code: 完整的 Python 代码字符串。
+            step_id: 当前步骤号，影响图表文件名。默认 0。
+
+        返回：执行结果摘要（含 stdout 和图表路径）。
+        """
+        sandbox_input = SandboxInput(
+            code=code,
+            step_id=step_id,
+            query_results=query_results,
+        )
+        result = _execute_python_core(sandbox_input)
+
+        # 关键：在源头捕获结果到共享 list
+        # 这样 graph 层不需要重跑沙盒就能拿到 AnalysisResult
+        if captures is not None:
+            captures.append(result)
+
+        return result.to_llm_string()
+
+    return run_python
+
+
+# ============================================================================
+# 导出：各 Agent 使用的工具列表
+#
+# 【为什么集中导出？】
 #   不同 Agent 用不同工具子集：
-#     - Query Agent → 4 个数据探查/执行工具（本列表）
-#     - Analysis Agent → python_sandbox + 数据读取工具
-#     - Planner → 无工具（纯 LLM 结构化输出）
-#
-#   所以每个文件导出"它服务的 Agent 的工具列表"最清晰。
+#     - Query Agent → 4 个数据探查/执行工具（QUERY_AGENT_TOOLS，静态）
+#     - Analysis Agent → run_python（动态工厂构建）
+#     - Planner → 无工具（纯结构化输出）
 # ============================================================================
 QUERY_AGENT_TOOLS = [
     list_tables,
     describe_table,
     sample_rows,
     execute_sql,
+]
+
+# Analysis Agent 工具是动态的，导出工厂函数让 agents/analysis.py 调用
+# 用法：tools = [make_run_python_tool(query_results)]
+__all__ = [
+    "QUERY_AGENT_TOOLS",
+    "make_run_python_tool",
 ]

@@ -24,9 +24,9 @@ agents/query.py —— Query Agent 工厂
 
 from __future__ import annotations
 
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import create_react_agent
 
 from insight_pilot.config import get_settings
 from insight_pilot.prompts.query import QUERY_AGENT_SYSTEM_PROMPT
@@ -71,10 +71,12 @@ def build_query_agent() -> CompiledStateGraph:
     #             → conditional: 有 tool_calls? → tools (执行工具) → agent
     #                          : 没 tool_calls? → END
     #   3. 整个图被 compile() 成 CompiledGraph
-    agent = create_react_agent(
+    # LangChain V1.0 把 create_react_agent 改名为 create_agent 并移到 langchain.agents
+    # 它内部仍然是 ReAct 模式，只是命名更通用
+    agent = create_agent(
         model=llm,
         tools=QUERY_AGENT_TOOLS,
-        prompt=QUERY_AGENT_SYSTEM_PROMPT,
+        system_prompt=QUERY_AGENT_SYSTEM_PROMPT,
     )
 
     return agent
