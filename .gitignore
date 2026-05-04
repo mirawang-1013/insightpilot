@@ -65,3 +65,4 @@ notebooks/**/*.ipynb_checkpoints
 *.sqlite
 *.sqlite3
 checkpoints.db
+.checkpoints.db

@@ -43,6 +43,7 @@ from insight_pilot.agents.analysis import build_analysis_agent
 from insight_pilot.agents.planner import build_planner
 from insight_pilot.agents.query import build_query_agent
 from insight_pilot.agents.reporter import build_reporter
+from insight_pilot.agents.reviewer import reviewer_node
 from insight_pilot.state import AgentState, AnalysisResult, QueryResult
 from insight_pilot.tools.duckdb_executor import execute_sql as _execute_sql_core
 from insight_pilot.tools.knowledge_base import retrieve_business_context
@@ -271,22 +272,30 @@ def _extract_query_results(messages: list) -> list[QueryResult]:
 # ============================================================================
 # 图构造：build_graph
 # ============================================================================
-def build_graph() -> CompiledStateGraph:
+def build_graph(checkpointer=None) -> CompiledStateGraph:
     """
-    构造 Phase 3 的多节点图。
+    构造 Phase 5 完整图。
+
+    Args:
+        checkpointer: 可选的 Checkpointer 实例。
+                     不传则默认用 SqliteSaver 写到 .checkpoints.db。
+                     测试可以传 MemorySaver 避免污染磁盘。
 
     拓扑：
-      START → planner → step_router → (query | analysis) → step_router → ... → END
+      START → knowledge_retrieval → planner
+            → step_router →（query | analysis）→ step_router → ... → reporter
+            → reviewer →（可能 interrupt）→ END
     """
     builder = StateGraph(AgentState)
 
     # ---- 加节点 ----
-    # Phase 4 拓扑：knowledge_retrieval（入口）→ planner → 多步循环 → reporter → END
+    # Phase 5 拓扑：knowledge_retrieval（入口）→ planner → 多步循环 → reporter → reviewer → END
     builder.add_node("knowledge_retrieval", knowledge_retrieval_node)
     builder.add_node("planner", planner_node)
     builder.add_node("query", query_node)
     builder.add_node("analysis", analysis_node)
     builder.add_node("reporter", reporter_node)
+    builder.add_node("reviewer", reviewer_node)
 
     # ---- 加边 ----
     # 入口：START → knowledge_retrieval → planner
@@ -294,7 +303,7 @@ def build_graph() -> CompiledStateGraph:
     builder.add_edge("knowledge_retrieval", "planner")
 
     # planner / query / analysis 跑完后都进同一个路由
-    # 路由结果：query / analysis / report（Phase 4 把"done"换成"report"）
+    # 路由结果：query / analysis / report
     routes = {
         "query": "query",
         "analysis": "analysis",
@@ -304,10 +313,29 @@ def build_graph() -> CompiledStateGraph:
     builder.add_conditional_edges("query", decide_next_step, routes)
     builder.add_conditional_edges("analysis", decide_next_step, routes)
 
-    # reporter 是终点节点 —— 跑完直接 END
-    builder.add_edge("reporter", END)
+    # Phase 5 新增：reporter → reviewer → END
+    # reviewer 节点内部可能触发 interrupt()
+    # 不管 approve / reject，最终都到 END（reject 时 status="failed"）
+    builder.add_edge("reporter", "reviewer")
+    builder.add_edge("reviewer", END)
 
-    return builder.compile()
+    # ---- 编译图 ----
+    # 【Phase 5 关键】传 Checkpointer 才能让 interrupt() 工作
+    # SqliteSaver 把 state 写到 .checkpoints.db 文件，跨进程持久化
+    # 没有 Checkpointer → interrupt() 无法恢复（state 没地方存）
+    if checkpointer is None:
+        # 默认行为：用 SqliteSaver，文件在项目根的 .checkpoints.db
+        from insight_pilot.config import get_settings
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        import sqlite3
+
+        settings = get_settings()
+        db_path = settings.project_root / ".checkpoints.db"
+        # check_same_thread=False：允许多线程访问（pytest 等场景）
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
+
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ============================================================================

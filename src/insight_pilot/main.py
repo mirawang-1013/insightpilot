@@ -139,8 +139,11 @@ def query(
 
     例子：
       insight-pilot query "2017 年月度营收趋势"
-      insight-pilot query "SP 州客户的平均订单金额"
+      insight-pilot query "对比 Top 5 品类，给出投资建议"
     """
+    from datetime import datetime
+    from langgraph.types import Command
+
     console.print()
     console.print(Panel(
         f"[bold]{question}[/]",
@@ -149,29 +152,148 @@ def query(
     ))
 
     # ---- 构造图 + 初始状态 ----
-    # 用 Rich 的 status 显示"加载中"动画
     with console.status("[bold cyan]构建图...[/]", spinner="dots"):
         graph = build_graph()
         initial_state = create_initial_state(question)
 
-    console.print("\n[dim]开始执行 ReAct 循环...[/]\n")
+    # ---- thread_id：让 Checkpointer 能区分多次会话 ----
+    # 时间戳 + 随机后缀，唯一可读
+    thread_id = f"q_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # ---- 流式跑图 ----
-    # stream_mode="updates"：每个节点返回时 yield 一个 (node_name, update) 事件
-    # 相比 stream_mode="values"，updates 更适合展示"哪个节点刚跑完"
-    final_state: dict[str, Any] = {}
-    try:
-        for event in graph.stream(initial_state, stream_mode="updates"):
-            for node_name, node_update in event.items():
-                _render_event(node_name, node_update)
-                # 累积 final_state（updates 模式下需要手动合并）
-                final_state.update(node_update)
-    except Exception as e:
-        console.print(f"\n[red]❌ 图执行失败：{e}[/]")
-        raise typer.Exit(1)
+    console.print(f"\n[dim]thread_id: {thread_id}[/]")
+    console.print("[dim]开始执行 ReAct 循环...[/]\n")
+
+    # ---- 第一次跑图，可能触发 interrupt ----
+    final_state = _run_graph_with_interrupt_handling(
+        graph=graph,
+        first_input=initial_state,
+        config=config,
+    )
+
+    if final_state is None:
+        # 用户中断或异常退出
+        return
 
     # ---- 渲染最终结果 ----
     _render_final_result(initial_state, final_state, verbose=verbose)
+
+
+def _run_graph_with_interrupt_handling(
+    graph: Any,
+    first_input: Any,
+    config: dict,
+) -> dict | None:
+    """
+    跑图，支持 interrupt 循环。
+
+    流程：
+      1. 第一次 invoke
+      2. 检查返回值有没有 __interrupt__
+      3. 有：渲染 + 收用户输入 + Command(resume=...) 再 invoke
+      4. 没有：直接返回 final_state
+
+    Args:
+        graph: 编译好的 StateGraph
+        first_input: 第一次调用的输入（initial_state）
+        config: 含 thread_id 的配置
+
+    Returns:
+        final_state dict，或 None（用户取消）
+    """
+    from langgraph.types import Command
+
+    current_input = first_input
+    max_resume_loops = 5   # 最多 5 次 interrupt 循环（防御无限循环）
+    loop_count = 0
+
+    while True:
+        loop_count += 1
+        if loop_count > max_resume_loops:
+            console.print(f"\n[red]❌ 达到最大 interrupt 循环次数 ({max_resume_loops})，放弃[/]")
+            return None
+
+        try:
+            # 关键：用 stream 跑图能看到中间事件，最后一次的累积 state 就是 final
+            # 但 stream 的 last value 不好拿 —— 用 invoke 简单
+            result = graph.invoke(current_input, config=config)
+        except Exception as e:
+            console.print(f"\n[red]❌ 图执行失败：{e}[/]")
+            return None
+
+        # ---- 检查有没有 interrupt ----
+        # LangGraph 把 interrupt 信息暴露在 result 的 __interrupt__ 字段
+        interrupt_data = result.get("__interrupt__")
+
+        if not interrupt_data:
+            # 没有 interrupt，跑完了
+            return result
+
+        # ---- 有 interrupt：渲染 + 收输入 ----
+        # interrupt_data 是 list[Interrupt]，通常一次只有一个
+        interrupt_obj = interrupt_data[0]
+        interrupt_value = interrupt_obj.value if hasattr(interrupt_obj, "value") else interrupt_obj
+
+        decision = _handle_interrupt(interrupt_value)
+
+        if decision is None:
+            # 用户 Ctrl+C 取消
+            console.print("\n[yellow]⚠️  用户取消[/]")
+            return None
+
+        # ---- 用 Command(resume=...) 恢复 ----
+        # 下一轮 invoke 用 Command 而不是 initial_state
+        current_input = Command(resume=decision)
+
+
+def _handle_interrupt(interrupt_value: dict) -> str | None:
+    """
+    渲染敏感报告，让用户决定 approve / reject。
+
+    Returns:
+        "approve" / "reject"，或 None（用户取消）
+    """
+    console.print()
+    console.rule("[bold yellow]⚠️  人工审批[/]")
+    console.print()
+
+    # interrupt_value 含 report、reason、options
+    reason = interrupt_value.get("reason", "?")
+    matched_layer = interrupt_value.get("matched_layer", "?")
+    report = interrupt_value.get("report", "")
+
+    console.print(Panel(
+        f"[bold]触发原因：[/]{reason}\n[dim]检测层：{matched_layer}[/]",
+        border_style="yellow",
+        title="为什么需要审批",
+    ))
+    console.print()
+
+    # 渲染报告本身
+    console.print(Markdown(report))
+    console.print()
+
+    # 收输入
+    console.print("[bold]请决定：[/]")
+    console.print("  [green]a[/] 通过（按当前报告输出）")
+    console.print("  [red]r[/]  驳回（不输出报告）")
+    console.print()
+
+    try:
+        # rich Console 没有 input，直接用内置 input
+        # 但要让光标可见，用 Console.input（rich 提供，会自动 flush）
+        choice = console.input("[bold cyan]你的选择 (a/r): [/]").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    if choice.startswith("a"):
+        return "approve"
+    elif choice.startswith("r"):
+        return "reject"
+    else:
+        # 默认（保守）：如果用户输了奇怪的东西就当 reject
+        console.print(f"[yellow]未识别 '{choice}'，按 reject 处理[/]")
+        return "reject"
 
 
 def _render_final_result(
