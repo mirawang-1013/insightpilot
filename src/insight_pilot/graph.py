@@ -1,14 +1,16 @@
 """
-graph.py —— LangGraph StateGraph 定义（Phase 3 升级版）
+graph.py —— LangGraph StateGraph 定义（Phase 4 升级版）
 
-【Phase 3 拓扑】
+【Phase 4 拓扑】
     START
       ↓
-    [planner]              拆 user_query 成 list[ExecutionStep]
+    [knowledge_retrieval]  RAG 检索业务术语，写 State.business_context
+      ↓
+    [planner]              拆 user_query 成 list[ExecutionStep]（看到 business_context）
       ↓
     [step_router]          看当前 step_index 决定下一步
-      ├─→ [query_node]     如果是 query 步骤
-      ├─→ [analysis_node]  如果是 analysis 步骤
+      ├─→ [query_node]     如果是 query 步骤（注入 business_context 到 prompt）
+      ├─→ [analysis_node]  如果是 analysis 步骤（注入 business_context 到 prompt）
       └─→ END              所有步骤跑完
 
     query_node / analysis_node 跑完后回到 step_router 判断下一步。
@@ -23,33 +25,62 @@ graph.py —— LangGraph StateGraph 定义（Phase 3 升级版）
 【循环计数保护】
     iteration_count 每次进 step_router 都 +1，超过 max_iterations 强制 END。
     防止某个 step 反复失败导致死循环。
+
+【RAG 注入策略】
+    knowledge_retrieval_node 一次检索，写进 State.business_context。
+    planner_node 把它作为额外 SystemMessage 喂给 Planner LLM。
+    query_node / analysis_node 把它作为 prompt 前缀喂给对应 Agent。
+    整图只检索一次 —— 多次检索没意义（business_context 是 query 级别的元信息）。
 """
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from insight_pilot.agents.analysis import build_analysis_agent
 from insight_pilot.agents.planner import build_planner
 from insight_pilot.agents.query import build_query_agent
+from insight_pilot.agents.reporter import build_reporter
 from insight_pilot.state import AgentState, AnalysisResult, QueryResult
 from insight_pilot.tools.duckdb_executor import execute_sql as _execute_sql_core
+from insight_pilot.tools.knowledge_base import retrieve_business_context
+
+
+# ============================================================================
+# 节点 0：knowledge_retrieval_node
+#
+# 第一个跑的节点。从 ChromaDB 检索和 user_query 相关的业务术语。
+# 检索失败也不致命（retrieve_business_context 异常时返回空字符串）。
+# ============================================================================
+def knowledge_retrieval_node(state: AgentState) -> dict:
+    """
+    知识库检索节点：把相关业务上下文写进 State.business_context。
+    """
+    context = retrieve_business_context(state["user_query"], top_k=5)
+    return {
+        "business_context": context,
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
 
 
 # ============================================================================
 # 节点 1：planner_node
 #
 # 一次 LLM 调用产出 list[ExecutionStep]。
-# 没有循环、没有工具，最简单的节点。
+# 现在会读 State.business_context 给 Planner 注入业务术语。
 # ============================================================================
 def planner_node(state: AgentState) -> dict:
     """
     Planner 节点：拆解 user_query 为执行步骤序列。
     """
     planner = build_planner()
-    steps = planner(state["user_query"])
+    # 把 RAG 检索到的业务上下文也喂进 Planner
+    steps = planner(
+        user_query=state["user_query"],
+        business_context=state.get("business_context", ""),
+    )
 
     return {
         "execution_plan": steps,
@@ -76,9 +107,18 @@ def query_node(state: AgentState) -> dict:
     # ---- 调 Query Agent ----
     agent = build_query_agent()
 
-    # 把当前 step 的 description 当作子任务喂进去
-    user_msg = HumanMessage(content=f"任务：{current_step.description}")
-    agent_result = agent.invoke({"messages": [user_msg]})
+    # 构造消息：可选业务上下文 + 子任务
+    # 业务上下文用 SystemMessage 注入，让 LLM 把它当成"环境信息"而非用户请求
+    messages: list = []
+    biz_ctx = state.get("business_context", "")
+    if biz_ctx.strip():
+        messages.append(SystemMessage(content=(
+            "以下是从业务知识库检索到的相关上下文，"
+            "在写 SQL 时请遵守这些定义和口径：\n\n" + biz_ctx
+        )))
+    messages.append(HumanMessage(content=f"任务：{current_step.description}"))
+
+    agent_result = agent.invoke({"messages": messages})
     all_messages = agent_result["messages"]
 
     # ---- 从 Agent 跑过的工具调用里抽出 SQL 结果 ----
@@ -119,12 +159,20 @@ def analysis_node(state: AgentState) -> dict:
     captures: list[AnalysisResult] = []
     agent = build_analysis_agent(query_results_dicts, captures=captures)
 
-    # 给 Agent 的任务描述里附上 step_id，让 LLM 知道用哪个 id 命名图表
-    user_msg = HumanMessage(content=(
+    # 构造消息：可选业务上下文 + 子任务（含 step_id）
+    messages: list = []
+    biz_ctx = state.get("business_context", "")
+    if biz_ctx.strip():
+        messages.append(SystemMessage(content=(
+            "以下是从业务知识库检索到的相关上下文，"
+            "在写代码或给业务结论时请参考：\n\n" + biz_ctx
+        )))
+    messages.append(HumanMessage(content=(
         f"任务：{current_step.description}\n"
         f"step_id：{current_step.step_id}（请用这个数字命名图表文件）"
-    ))
-    agent_result = agent.invoke({"messages": [user_msg]})
+    )))
+
+    agent_result = agent.invoke({"messages": messages})
     all_messages = agent_result["messages"]
 
     # ---- 从 captures 直接拿结果，不需要重跑 ----
@@ -143,31 +191,51 @@ def analysis_node(state: AgentState) -> dict:
 
 
 # ============================================================================
+# 节点 4：reporter_node
+#
+# 所有 plan 步骤跑完后，综合 State 生成 Markdown 报告。
+# ============================================================================
+def reporter_node(state: AgentState) -> dict:
+    """
+    Reporter 节点：把执行结果综合成 Markdown 报告。
+    """
+    reporter = build_reporter()
+    report_md = reporter(state)
+
+    return {
+        "report_markdown": report_md,
+        "status": "complete",
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
+
+
+# ============================================================================
 # 路由函数：decide_next_step
 #
 # 【这个函数不是节点 —— 是条件边的判断器】
 #   add_conditional_edges 接受这个函数，根据返回值决定下一个节点。
 #   纯函数：读 state，返回字符串，无副作用。
 #
-# 【返回值的含义】
+# 【返回值的含义（Phase 4 更新）】
 #   "query"     → 跑 query_node
 #   "analysis"  → 跑 analysis_node
-#   "done"      → 跳到 END
+#   "report"    → 跑 reporter_node（所有步骤跑完时去这里）
 # ============================================================================
 def decide_next_step(state: AgentState) -> str:
     """
     根据当前 step_index 和 max_iterations 判断下一步去哪。
     """
-    # ---- 安全闸：超过最大迭代次数强制结束 ----
+    # ---- 安全闸：超过最大迭代次数强制去 reporter ----
+    # 即使没跑完也写一份"半成品报告"，比直接 END 友好
     if state["iteration_count"] >= state["max_iterations"]:
-        return "done"
+        return "report"
 
     plan = state.get("execution_plan", [])
     idx = state.get("current_step_index", 0)
 
-    # ---- 所有步骤跑完了 → END ----
+    # ---- 所有步骤跑完了 → 去写报告 ----
     if idx >= len(plan):
-        return "done"
+        return "report"
 
     # ---- 看当前 step 的 type ----
     current_step = plan[idx]
@@ -176,9 +244,8 @@ def decide_next_step(state: AgentState) -> str:
     elif current_step.step_type == "analysis":
         return "analysis"
     else:
-        # 不应该发生（Pydantic 已经校验过 step_type 是合法 Literal）
-        # 但留个兜底，万一未来加新类型时旧代码不挂
-        return "done"
+        # 不应该发生（Pydantic 已校验），但留个兜底
+        return "report"
 
 
 # ============================================================================
@@ -214,48 +281,31 @@ def build_graph() -> CompiledStateGraph:
     builder = StateGraph(AgentState)
 
     # ---- 加节点 ----
+    # Phase 4 拓扑：knowledge_retrieval（入口）→ planner → 多步循环 → reporter → END
+    builder.add_node("knowledge_retrieval", knowledge_retrieval_node)
     builder.add_node("planner", planner_node)
     builder.add_node("query", query_node)
     builder.add_node("analysis", analysis_node)
+    builder.add_node("reporter", reporter_node)
 
     # ---- 加边 ----
-    # 入口：START → planner
-    builder.add_edge(START, "planner")
+    # 入口：START → knowledge_retrieval → planner
+    builder.add_edge(START, "knowledge_retrieval")
+    builder.add_edge("knowledge_retrieval", "planner")
 
-    # planner 跑完 → 进入条件路由判断第一步去哪
-    # 注意：我们没把 step_router 写成节点，而是直接用 add_conditional_edges
-    # 把"路由"作为 planner 的出边来表达。这样图里少一个节点，结构更紧凑。
-    builder.add_conditional_edges(
-        "planner",          # 从 planner 出发
-        decide_next_step,   # 调用这个函数判断去哪
-        {
-            "query": "query",
-            "analysis": "analysis",
-            "done": END,
-        },
-    )
+    # planner / query / analysis 跑完后都进同一个路由
+    # 路由结果：query / analysis / report（Phase 4 把"done"换成"report"）
+    routes = {
+        "query": "query",
+        "analysis": "analysis",
+        "report": "reporter",
+    }
+    builder.add_conditional_edges("planner", decide_next_step, routes)
+    builder.add_conditional_edges("query", decide_next_step, routes)
+    builder.add_conditional_edges("analysis", decide_next_step, routes)
 
-    # query 跑完 → 同样进路由（决定下一步是再 query 还是 analysis 还是 END）
-    builder.add_conditional_edges(
-        "query",
-        decide_next_step,
-        {
-            "query": "query",
-            "analysis": "analysis",
-            "done": END,
-        },
-    )
-
-    # analysis 跑完 → 同样进路由
-    builder.add_conditional_edges(
-        "analysis",
-        decide_next_step,
-        {
-            "query": "query",
-            "analysis": "analysis",
-            "done": END,
-        },
-    )
+    # reporter 是终点节点 —— 跑完直接 END
+    builder.add_edge("reporter", END)
 
     return builder.compile()
 

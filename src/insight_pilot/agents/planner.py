@@ -105,21 +105,31 @@ def build_planner():
 
     # ---- 返回闭包 ----
     # 闭包捕获 structured_llm，每次 plan() 调用都复用同一个 LLM 实例
-    def plan(user_query: str) -> list[ExecutionStep]:
+    def plan(user_query: str, business_context: str = "") -> list[ExecutionStep]:
         """
         把用户的自然语言问题拆成执行步骤。
 
         Args:
             user_query: 用户原始问题。
+            business_context: 知识库检索到的业务上下文（可选）。
+                如果非空，会作为额外 SystemMessage 注入，帮助 Planner 理解专业术语。
 
         Returns:
             list[ExecutionStep] —— 已经过 Pydantic 校验，下游可直接用。
         """
-        # 构造消息：system prompt（教怎么拆）+ human message（用户问题）
-        messages = [
-            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-            HumanMessage(content=user_query),
-        ]
+        # 构造消息：system prompt（教怎么拆）+ 可选业务上下文 + human message（用户问题）
+        messages: list = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)]
+
+        # 如果有检索到的业务上下文，作为额外 system message 注入
+        # 这样 Planner 就知道 "ROAS 怎么定义" "投资建议要看哪些维度" 等
+        if business_context.strip():
+            messages.append(SystemMessage(content=(
+                "以下是从业务知识库检索到的相关上下文，"
+                "在拆解步骤时请参考这些定义和口径：\n\n"
+                + business_context
+            )))
+
+        messages.append(HumanMessage(content=user_query))
 
         # 调 LLM。返回的 result 已经是 ExecutionPlan 实例（Pydantic 对象）
         # 如果 LLM 返回的 JSON 不符合 schema，langchain-openai 会自动重试 3 次

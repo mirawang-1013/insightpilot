@@ -179,26 +179,55 @@ def _render_final_result(
     final_state: dict[str, Any],
     verbose: bool = False,
 ) -> None:
-    """用表格渲染最终的查询结果。"""
+    """渲染最终的查询结果 + 保存并展示 Markdown 报告。"""
     # query_results 是累积的 QueryResult 列表
     query_results = final_state.get("query_results", [])
 
-    if not query_results:
-        console.print("\n[yellow]⚠️  未拿到任何 SQL 查询结果[/]")
-        return
+    if query_results:
+        console.print()
+        console.print(f"[bold]📊 共执行 {len(query_results)} 条 SQL 查询[/]\n")
+        # 展示最后一条结果为表格（最常是用户最关心的那条）
+        last_result = query_results[-1]
+        _render_query_result_as_table(last_result)
 
-    console.print()
-    console.print(f"[bold]📊 共执行 {len(query_results)} 条 SQL 查询[/]\n")
-
-    # 展示最后一条（最相关的）结果为表格
-    last_result = query_results[-1]
-    _render_query_result_as_table(last_result)
+    # ---- Phase 4 新增：保存并渲染 Markdown 报告 ----
+    report_md = final_state.get("report_markdown", "")
+    if report_md:
+        _save_and_render_report(report_md)
+    else:
+        console.print("\n[yellow]⚠️  未生成报告（report_markdown 字段为空）[/]")
 
     # verbose 模式：打印完整 messages
     if verbose:
         console.rule("[dim]Verbose: 所有 messages[/]")
         for msg in final_state.get("messages", []):
             console.print(f"[dim]{type(msg).__name__}:[/] {str(msg)[:200]}")
+
+
+def _save_and_render_report(report_md: str) -> None:
+    """
+    把 Markdown 报告保存到 outputs/report_<timestamp>.md，
+    并用 rich 在终端渲染（终端会显示带颜色的标题、表格等）。
+    """
+    from datetime import datetime
+    from pathlib import Path
+    from insight_pilot.config import get_settings
+
+    settings = get_settings()
+    outputs_dir = settings.outputs_dir
+    outputs_dir.mkdir(exist_ok=True)
+
+    # 时间戳文件名：方便追溯
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = outputs_dir / f"report_{ts}.md"
+    report_path.write_text(report_md, encoding="utf-8")
+
+    # ---- 终端渲染（用 rich 的 Markdown 解析器，支持标题/列表/代码块/链接）----
+    console.rule(f"[bold green]📄 报告（已保存到 {report_path.relative_to(settings.project_root)}）[/]")
+    console.print()
+    console.print(Markdown(report_md))
+    console.print()
+    console.rule()
 
 
 def _render_query_result_as_table(result: Any) -> None:
