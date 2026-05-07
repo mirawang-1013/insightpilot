@@ -220,6 +220,7 @@ class TestCreateInitialState:
             "execution_plan",
             "current_step_index",
             "business_context",
+            "retrieved_exemplars",
             "explored_schemas",
             "query_results",
             "analysis_results",

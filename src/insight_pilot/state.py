@@ -240,6 +240,12 @@ class AgentState(TypedDict):
     # RAG 从 ChromaDB 检索出的业务上下文，插进 Agent 的 prompt
     business_context: str
 
+    # ========== 历史 exemplar 检索（自我改善飞轮）==========
+    # 从 exemplar_store 检索到的 Top-K 历史成功查询
+    # 每条是 dict 格式（Exemplar.to_metadata 的反序列化），便于序列化进 LangGraph state
+    # 一次性写入（在 knowledge_retrieval_node 里），无 reducer
+    retrieved_exemplars: list[dict[str, Any]]
+
     # ========== Query Agent 产出（累积）==========
     # 已探查过的表名。防止 Agent 在 ReAct 循环里重复探查同一张表
     explored_schemas: Annotated[list[str], operator.add]
@@ -333,6 +339,7 @@ def create_initial_state(
         execution_plan=[],
         current_step_index=0,
         business_context="",
+        retrieved_exemplars=[],
         explored_schemas=[],
         query_results=[],
         analysis_results=[],

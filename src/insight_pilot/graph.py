@@ -46,6 +46,11 @@ from insight_pilot.agents.reporter import build_reporter
 from insight_pilot.agents.reviewer import reviewer_node
 from insight_pilot.state import AgentState, AnalysisResult, QueryResult
 from insight_pilot.tools.duckdb_executor import execute_sql as _execute_sql_core
+from insight_pilot.tools.exemplar_store import (
+    Exemplar,
+    retrieve_exemplars,
+    save_exemplar,
+)
 from insight_pilot.tools.knowledge_base import retrieve_business_context
 
 
@@ -57,11 +62,36 @@ from insight_pilot.tools.knowledge_base import retrieve_business_context
 # ============================================================================
 def knowledge_retrieval_node(state: AgentState) -> dict:
     """
-    知识库检索节点：把相关业务上下文写进 State.business_context。
+    知识库检索节点：
+      1. 检索业务知识 → State.business_context
+      2. 检索历史 exemplar → State.retrieved_exemplars
+
+    两个检索同时进行，都失败也不致命（返回空字符串/空列表）。
     """
-    context = retrieve_business_context(state["user_query"], top_k=5)
+    user_query = state["user_query"]
+
+    # 业务知识库检索（第四阶段已有）
+    context = retrieve_business_context(user_query, top_k=5)
+
+    # 历史 exemplar 检索（新增）
+    # only_approved=True：只用经审批通过的样本，保证质量
+    exemplars = retrieve_exemplars(user_query, top_k=3, only_approved=True)
+    # 转 dict 列表存进 state（方便序列化 + Pydantic 过校验）
+    exemplar_dicts = [
+        {
+            "user_question": e.user_question,
+            "execution_plan": e.execution_plan,
+            "sqls": e.sqls,
+            "timestamp": e.timestamp,
+            "approved_by_reviewer": e.approved_by_reviewer,
+            "exemplar_id": e.exemplar_id,
+        }
+        for e in exemplars
+    ]
+
     return {
         "business_context": context,
+        "retrieved_exemplars": exemplar_dicts,
         "iteration_count": state.get("iteration_count", 0) + 1,
     }
 
@@ -75,12 +105,29 @@ def knowledge_retrieval_node(state: AgentState) -> dict:
 def planner_node(state: AgentState) -> dict:
     """
     Planner 节点：拆解 user_query 为执行步骤序列。
+
+    现在还会读 State.retrieved_exemplars，作为 few-shot 注入 Planner prompt。
     """
     planner = build_planner()
-    # 把 RAG 检索到的业务上下文也喂进 Planner
+
+    # 把 dict 形式的 exemplar 转回 Exemplar 对象给 planner 用
+    exemplar_dicts = state.get("retrieved_exemplars", []) or []
+    exemplars = [
+        Exemplar(
+            user_question=d["user_question"],
+            execution_plan=d.get("execution_plan", []),
+            sqls=d.get("sqls", []),
+            timestamp=d.get("timestamp", ""),
+            approved_by_reviewer=d.get("approved_by_reviewer", False),
+            exemplar_id=d.get("exemplar_id", ""),
+        )
+        for d in exemplar_dicts
+    ]
+
     steps = planner(
         user_query=state["user_query"],
         business_context=state.get("business_context", ""),
+        exemplars=exemplars,
     )
 
     return {

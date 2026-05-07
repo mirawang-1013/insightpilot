@@ -31,7 +31,35 @@ from __future__ import annotations
 from langgraph.types import interrupt
 
 from insight_pilot.state import AgentState
+from insight_pilot.tools.exemplar_store import save_exemplar
 from insight_pilot.tools.sensitivity import classify_sensitivity
+
+
+def _save_exemplar_from_state(state: AgentState, approved_by_reviewer: bool) -> None:
+    """
+    从当前 state 提取信息并存 exemplar。
+    在 reviewer 决定通过时调用。
+
+    【为什么独立成函数】
+      reviewer_node 有两条"通过"路径（安全自动通过 + 敏感经审批通过），
+      避免重复代码。
+    """
+    user_query = state.get("user_query", "")
+    plan = state.get("execution_plan", []) or []
+    query_results = state.get("query_results", []) or []
+
+    # 抽出所有成功 SQL
+    sqls = [qr.sql for qr in query_results if getattr(qr, "success", False)]
+    if not sqls:
+        # 没有成功 SQL，不值得存
+        return
+
+    save_exemplar(
+        user_question=user_query,
+        execution_plan=plan,        # ExecutionStep 对象列表
+        sqls=sqls,
+        approved_by_reviewer=approved_by_reviewer,
+    )
 
 
 # ============================================================================
@@ -60,6 +88,8 @@ def reviewer_node(state: AgentState) -> dict:
 
     # ---- 安全：直接通过，不打扰人 ----
     if not sensitivity.is_sensitive:
+        # 自动通过的也存 exemplar（approved_by_reviewer=False，标记是自动判定）
+        _save_exemplar_from_state(state, approved_by_reviewer=False)
         return {
             "needs_human_review": False,
             "human_feedback": None,
@@ -97,6 +127,8 @@ def reviewer_node(state: AgentState) -> dict:
     decision_str = str(decision).strip().lower()
 
     if decision_str.startswith("a") or decision_str == "approve":
+        # 经人工审批通过 → 高质量 exemplar
+        _save_exemplar_from_state(state, approved_by_reviewer=True)
         return {
             "needs_human_review": True,
             "human_feedback": "approved",

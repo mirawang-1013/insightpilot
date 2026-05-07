@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from insight_pilot.config import get_settings
 from insight_pilot.prompts.planner import PLANNER_SYSTEM_PROMPT
 from insight_pilot.state import ExecutionStep
+from insight_pilot.tools.exemplar_store import Exemplar, format_exemplars_for_prompt
 
 
 # ============================================================================
@@ -105,7 +106,11 @@ def build_planner():
 
     # ---- 返回闭包 ----
     # 闭包捕获 structured_llm，每次 plan() 调用都复用同一个 LLM 实例
-    def plan(user_query: str, business_context: str = "") -> list[ExecutionStep]:
+    def plan(
+        user_query: str,
+        business_context: str = "",
+        exemplars: list[Exemplar] | None = None,
+    ) -> list[ExecutionStep]:
         """
         把用户的自然语言问题拆成执行步骤。
 
@@ -113,20 +118,31 @@ def build_planner():
             user_query: 用户原始问题。
             business_context: 知识库检索到的业务上下文（可选）。
                 如果非空，会作为额外 SystemMessage 注入，帮助 Planner 理解专业术语。
+            exemplars: 历史相似的成功查询（可选）。
+                作为 few-shot 注入，帮助 Planner 模仿过去的拆解风格。
 
         Returns:
             list[ExecutionStep] —— 已经过 Pydantic 校验，下游可直接用。
         """
-        # 构造消息：system prompt（教怎么拆）+ 可选业务上下文 + human message（用户问题）
+        # 构造消息：system prompt + 业务上下文 + few-shot exemplars + 用户问题
         messages: list = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)]
 
         # 如果有检索到的业务上下文，作为额外 system message 注入
-        # 这样 Planner 就知道 "ROAS 怎么定义" "投资建议要看哪些维度" 等
         if business_context.strip():
             messages.append(SystemMessage(content=(
                 "以下是从业务知识库检索到的相关上下文，"
                 "在拆解步骤时请参考这些定义和口径：\n\n"
                 + business_context
+            )))
+
+        # 如果有历史 exemplar，作为 few-shot 注入
+        # 这是"自我改善飞轮"的核心：过去成功的查询作为参考
+        if exemplars:
+            exemplar_block = format_exemplars_for_prompt(exemplars)
+            messages.append(SystemMessage(content=(
+                exemplar_block
+                + "\n\n注意：这些是历史成功的拆解，但你必须根据当前问题调整，"
+                "不要照抄。如果当前问题不同，按你的判断重新拆。"
             )))
 
         messages.append(HumanMessage(content=user_query))
