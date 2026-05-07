@@ -294,13 +294,26 @@ def retrieve_exemplars(
             return []
 
         # ---- 第二遍：按 quality_score 加权重排 ----
-        # final_score = chroma_rank（越小越靠前） × (100 / quality_score)
-        # quality 高 → 加权后 score 更小 → 更靠前
-        # 防御：score 为 0 时用 1 避免除零
+        # 公式：final_score = (chroma_rank + 1) × (100 / quality_score)
+        # 排序 ascending（值小靠前）。
+        #
+        # 【为什么是 chroma_rank + 1，不是 chroma_rank？】
+        #   如果用裸 chroma_rank，rank=0（最相似）会让 final_score=0，
+        #   不管 quality 多差都成绝对赢家 —— 质量分被完全忽略。
+        #   加 +1 偏置：rank=0 也会被 quality 影响，让两个维度真正参与排序。
+        #
+        # 【举例 quality 怎么影响排序】
+        #   chroma_rank=0, q=100 → (0+1) × 1 = 1     ← 最高质量的语义最近样本
+        #   chroma_rank=0, q=30  → (0+1) × 3.33 = 3.33 ← 同样最相似但质量差
+        #   chroma_rank=2, q=100 → (2+1) × 1 = 3     ← 不那么相似但质量满分
+        #   排序：q=100/rank=0 第一，q=100/rank=2 第二，q=30/rank=0 第三 ✓
+        #
+        # 【防御 max(quality_score, 1)】
+        #   万一 quality 为 0（理论可能：极端 downvote 后），避免除零。
         def weighted_rank(item: tuple[int, Exemplar]) -> float:
             chroma_rank, ex = item
             quality_factor = 100 / max(ex.quality_score, 1)
-            return chroma_rank * quality_factor
+            return (chroma_rank + 1) * quality_factor
 
         candidates.sort(key=weighted_rank)
 
