@@ -744,3 +744,509 @@ finally:
 
 > **关于 execute_sql 设计细节**：
 > "几个工程细节：回执用原始 sql，内部用 stripped sql —— 不让实现细节泄漏到对外接口。LIMIT max+1 多取 1 行做边界探测识别截断。rows 用 list[dict] 不用 list[tuple] 给值贴列名标签，LLM 友好。try/except/finally 三段保证连接不泄漏。"
+
+---
+
+# Part 5：Execution Memory 实现细节（4 个 Section，12 个 Q&A）
+
+> 这是给 InsightPilot 加"自我改善飞轮"的实现复盘。
+> 涉及 5 个文件的改动：tools/exemplar_store.py（新建）+ state.py / graph.py / planner.py / reviewer.py（修改）+ 4 个优化（quality_score / last_validated_at / team_id / upvote/downvote）。
+
+## Section A：存储层（exemplar_store.py 核心）
+
+### Q1：为什么用单独的 ChromaDB collection（`insight_pilot_exemplars`），不和 `insight_pilot_kb` 混在一起？
+
+💡 **答案**：两类数据**生命周期 + 内容形态 + 消费模式**都不同。
+
+**生产者不同**：知识是人写的；exemplar 是系统自动累积的
+**消费时机不同**：知识每次都用；exemplar 按相似度命中才用
+**质量门控不同**：知识默认权威；exemplar 需要 approved + 非 stale 过滤
+**管理操作不同**：知识手工编辑；exemplar 需要 validate / upvote 等运维 API
+
+**4 个具体失败模式**（如果混在一起）：
+1. **检索污染** —— 烂 exemplar 被 RAG 检索为业务知识返回
+2. **质量门控逻辑错位** —— knowledge 不需要 approved 字段
+3. **文档长度差异** —— 长知识文档会挤掉短 exemplar
+4. **批量管理困难** —— 想清空 exemplar 池没法做（会带走知识）
+
+🎯 **架构原则**：**Bounded Context（限界上下文）** —— 不同生命周期 / 不同消费模式的数据，应该有自己的存储。**混在一起短期省事，长期是技术债。**
+
+---
+
+### Q2：`Exemplar` dataclass 的 list / dict 字段为什么要 `json.dumps(...)` 序列化？
+
+```python
+def to_metadata(self) -> dict[str, str]:
+    return {
+        "execution_plan_json": json.dumps(self.execution_plan, ensure_ascii=False),
+        "sqls_json": json.dumps(self.sqls, ensure_ascii=False),
+        ...
+    }
+```
+
+💡 **答案**：ChromaDB 的 metadata **只接受基础类型**（str / int / float / bool），不接受 list 或 dict。所以必须把 list 序列化成字符串（JSON 编码）后再塞 metadata。
+
+**关键修正**：不是把 list **转 dict**，是把 list **转字符串**。metadata 本身**就是个 dict**（外层结构），dict 里的 value 必须是基础类型。
+
+---
+
+### Q3：`from_metadata` 用 `metadata.get("execution_plan_json", "[]")` 给空字符串默认值，为什么？
+
+💡 **答案**：**幽灵字段保护**（schema 演进时的健壮性）。
+
+如果某条老 exemplar 是在加这个字段**之前**存的，metadata 里就**没这个键**。`.get()` 返回 `None`，`json.loads(None)` 会崩。
+
+给 `"[]"` 默认值兜底：
+- 没这个键 → 返回 `"[]"`（合法的空数组 JSON）
+- json.loads("[]") → 返回 `[]`（空 Python list）
+- 老数据优雅退化，新代码不挂
+
+🎯 **核心原则**：**数据 schema 演进时，反序列化要能优雅退化**。这是 schema migration 的基础防御。
+
+---
+
+### Q4：`save_exemplar` 和 `retrieve_exemplars` 都用 try/except 包主逻辑，失败 print 到 stderr 但 `return None`，为什么？
+
+💡 **答案**：**Best-effort side-effect** —— exemplar 存储是辅助优化，**绝不能让它害死主任务**。
+
+**反例**：如果让异常抛出去：
+```
+主任务（取数 + 报告）已经成功
+    ↓
+save_exemplar 抛异常（磁盘满 / ChromaDB 崩）
+    ↓
+graph.invoke 抛异常 → CLI 显示"❌ 失败"
+    ↓
+用户困惑："到底成功没？"
+```
+
+**周边功能的失败，不该让核心功能跟着死**。
+
+**但又不完全静默** —— 我们 print 到 **stderr**：
+- 用户：主任务成功 ✓（不被打扰）
+- 运维：stderr 有 WARN，可被 grep / 日志系统抓
+
+🎯 **判断准则**：这个操作如果失败，**用户的预期是什么**？
+- 期望"必然完成"（付款、写订单）→ 让异常抛出
+- 期望"尽力而为"（缓存、日志、exemplar）→ silent fallback
+
+---
+
+## Section B：State 集成
+
+### Q5：State 字段为什么是 `list[dict[str, Any]]` 而不是 `list[Exemplar]`？
+
+💡 **答案**：**LangGraph 的 SqliteSaver 用 msgpack 序列化 state 写到 SQLite**，自定义类型（dataclass / Pydantic）默认不支持序列化。
+
+**如果用 list[Exemplar]**：
+```
+节点返回 {"retrieved_exemplars": [Exemplar(...), ...]}
+    ↓
+LangGraph 想 msgpack.dumps(state)
+    ↓
+遇到 Exemplar 对象不知道怎么办 → 抛 TypeError → 第一次跑节点就崩
+```
+
+🎯 **DTO 模式**（Data Transfer Object）：**跨边界用基础类型，模块内部用富对象**。
+- 模块内（exemplar_store）→ Exemplar dataclass（有方法、有类型）
+- 跨边界（state）→ dict（保证 msgpack 可序列化）
+- 需要时反序列化回 Exemplar（在 planner_node 里做）
+
+类比：邮政系统。家里写信用普通信纸（Exemplar），寄出去要装信封（dict），收件人拆信封再读信纸。
+
+---
+
+### Q6：为什么 `retrieved_exemplars` 不需要 `Annotated[..., operator.add]` reducer？
+
+💡 **答案**：因为它**只有一个节点写入**（`knowledge_retrieval_node`），不需要累积。
+
+**reducer 判定准则**（从 Part 1 复习）：
+- 单写多读 → 默认覆盖语义已经正确，不需要 reducer
+- 多写 + 想保留全部 → 需要 reducer（如 operator.add）
+- 多写 + 只关心最新 → 不需要 reducer（默认覆盖）
+
+**如果硬加 operator.add 会怎样？**
+```
+Query 1 跑完：累积 5 条 exemplar
+Query 2 跑完：8 条
+Query 100 跑完：几百条
+```
+prompt 越来越长 → token 爆炸 → LLM 注意力被稀释。
+
+🎯 **YAGNI 原则**：现在不用就别加。哪天真要"累积+去重"，再写自定义 reducer。
+
+---
+
+## Section C：Graph 接线
+
+### Q7：为什么 RAG + exemplar 检索塞进**同一个** `knowledge_retrieval_node`？不分两个节点？
+
+💡 **答案**：**LangGraph 节点之间有"重大 overhead"**。
+
+每次节点转换 LangGraph 内部要做：
+1. 节点返回 dict + reducer 合并进 state
+2. **Checkpointer 把整个 state 序列化（msgpack）写到 SQLite**
+3. 路由判断
+4. 从 Checkpointer 读出 state（反序列化）
+
+**两次检索分两个节点 = 多一次 SQLite I/O 写盘 + 读盘**（每次几十毫秒，可观）。
+
+🎯 **Cohesion 原则**："**会一起变化的东西，应该放一起**"。
+
+RAG + exemplar 检索：
+- 同一时机（plan 之前）
+- 同一目的（给 planner 上下文）
+- 同一失败模式（都用 silent fallback）
+- 互相**没数据依赖**
+
+→ 高内聚 + 无依赖，**应该放一个节点**。
+
+**何时该拆**？
+- 它们之间**有数据依赖**（A 决定 B 怎么跑）
+- 它们的**失败需要不同恢复策略**
+- 它们的**触发时机不同**
+
+---
+
+### Q8：`planner_node` 里把 dict 列表"重新拼"成 Exemplar 对象列表，为什么？直接传 dict 不行吗？
+
+```python
+exemplars = [
+    Exemplar(
+        user_question=d["user_question"],
+        execution_plan=d.get("execution_plan", []),
+        ...
+    )
+    for d in exemplar_dicts
+]
+```
+
+💡 **答案**：**DTO 模式的"反向"** —— Section B 讲了"为什么存 dict"，这里讲"用的时候转回来"。
+
+**3 个具体原因**：
+1. `build_planner` 内部期望 `list[Exemplar]` 类型契约（IDE / mypy 强约束）
+2. Exemplar 有 `.to_prompt_block()` 方法，dict 没有
+3. 让模块内部代码**享受类型安全和方法**，不用处理裸 dict 的脏活
+
+🎯 **DTO 模式是双向的**：
+- **出门**（写入 state）：富对象 → dict（保证可序列化）
+- **进门**（从 state 读出）：dict → 富对象（恢复类型安全和方法）
+
+类比：ORM。数据库存的是行（dict），程序内部用 Model 对象。每次查询时框架帮你做"升维"。
+
+---
+
+### Q9：reject 路径**不存** exemplar，为什么？把它存进去（标 `quality=0`）作为"反例"不行？
+
+💡 **答案**：**Exemplar 是 few-shot 的正样本**，不是中性数据点。
+
+LLM 看到 prompt 里"参考查询"**默认假设它该模仿**。所以**只能存值得被模仿的样本**。
+
+**反例进入 pool 会发生什么？**
+```
+LLM 看 prompt：
+   # 历史相似查询参考
+   ## 参考 [1]
+   SQL：SELECT ... （这是个被 reject 的烂 SQL）
+   
+LLM 想："噢这是参考样本，我也这么写"
+   ↓
+LLM 学着写错 SQL ❌
+```
+
+**3 个具体理由**：
+1. **语义反向** —— 反例混进正例池，LLM 会无差别学习
+2. **存储浪费** —— ChromaDB 每条都要 embed
+3. **隐式信任脆弱** —— "存了但相信我会过滤"比"根本不存"更容易出 bug
+
+🎯 **如果真要做"对比学习"**（Q vs A 的好坏对照），那是另一个独立 feature，需要专门的 prompt 结构。**现阶段 KISS。**
+
+---
+
+## Section D：4 个优化的细节
+
+### Q10：weighted_rank 公式 —— 一个我们一起发现的真实 bug
+
+```python
+def weighted_rank(item):
+    chroma_rank, ex = item
+    quality_factor = 100 / max(ex.quality_score, 1)
+    return chroma_rank * quality_factor   # ❌ bug！
+```
+
+跟踪 3 个候选：
+| 候选 | chroma_rank | quality | final_rank |
+|---|---|---|---|
+| A | 0（最相似）| 30（差）| **0** |
+| B | 1 | 100（满分）| 1 |
+| C | 2 | 60 | 3.33 |
+
+A 排第一 ❌ —— **质量很差但因为 chroma_rank=0，final_rank=0 永远赢**。
+
+💡 **bug 根源**：`0 × anything = 0`。最相似的样本变成绝对赢家，质量分被完全忽略。
+
+**修复**：加 +1 偏置
+```python
+return (chroma_rank + 1) * quality_factor   # ✓
+```
+
+修复后：
+- A: (0+1) × 3.33 = 3.33
+- B: (1+1) × 1 = 2     ← 满分质量战胜次相似度 ✓
+- C: (2+1) × 1.67 = 5
+
+🎯 **这是 sort fusion 算法的经典坑** —— `0 × X = 0` 让其中一个维度退化。**修法是加偏置或换 RRF（Reciprocal Rank Fusion）**。
+
+---
+
+### Q11：upvote +5 但 downvote -10，为什么不对称？
+
+💡 **答案**：**不对称代价 → 不对称响应**。
+
+| | upvote 误判 | downvote 误判 |
+|---|---|---|
+| 直接后果 | 烂例进 pool | 好例暂时缺席 |
+| 恢复成本 | **难**（污染传播）| 易（之后改回来）|
+| 发现难度 | **难**（隐式劣化）| 易（用户立刻发现）|
+| 业务影响 | **持续性**（每次检索都中招）| 偶发 |
+
+**留住烂 exemplar 是 heavy loss**（每次检索被毒）；**错过好 exemplar 是 mild loss**（少用一次）。
+
+**类比金融**：巴菲特 "第一原则别亏钱" —— 不要错过赚钱机会（mild penalty），不要亏钱（heavy penalty）。
+
+**还有一层**：**信号强度不对称**
+- upvote 信号弱（用户随手点赞多）→ +5 合理
+- downvote 信号强（用户特意点踩少）→ -10 合理
+
+🎯 **设计原则**：**"刹车要比油门重"**。这是 ML 评分系统里 asymmetric cost 的典型应用。
+
+---
+
+### Q12：`validate_all_stale_candidates` 为什么默认每周跑而不是每天 / 每小时？
+
+💡 **答案**：**频率应该匹配数据变化的真实速率**。
+
+**真实失效场景**：
+- schema 迁移（部署级，1-2 周）
+- 业务定义变更（需求级，月度）
+- 数据源切换（罕见）
+
+**这些都是"发布周期级"事件，不是"小时级"事件**。
+
+**频率选择矩阵**：
+| 频率 | 优点 | 缺点 |
+|---|---|---|
+| 每小时 | 实时 | **资源浪费**（同一批 SQL 重复跑）|
+| 每天 | 较及时 | 仍然过度 |
+| **每周** ⭐ | 匹配发布周期 | 最坏情况脏数据存活 7 天 |
+| 每月 | 资源最省 | 脏数据可能传播太久 |
+
+🎯 **进阶方案：组合用**
+- 后台每周定时（主动维护）
+- 检索时按需懒验证（兜底）：`last_validated_at > 60 天 → 实时验证再返回`
+
+类比缓存系统：TTL + on-access validation。
+
+---
+
+## Part 5 总结：4 个 Section 走过来的概念
+
+| Section | 核心概念 | 题数 |
+|---|---|---|
+| **A. 存储层** | Bounded Context / 序列化 / 幽灵字段 / Best-effort side-effect | 4 |
+| **B. State 集成** | DTO 模式 / YAGNI 原则 / Reducer 判定 | 2 |
+| **C. Graph 接线** | 节点粒度 / DTO 双向 / Few-shot 正样本语义 | 3 |
+| **D. 4 个优化** | Sort fusion 公式 + bug / 不对称代价响应 / 频率选择 | 3 |
+
+---
+
+# Part 6：metadata_explorer.py 走读（5 个 Q&A）
+
+> 这个文件的职责是给 LLM 提供"看清数据的眼睛"：list_tables / describe_table / sample_rows。
+> 看似简单但有几个**安全 + 性能 + LLM 友好**的精巧设计。
+
+## Section A：白名单防 SQL 注入
+
+### Q1：为什么 `describe_table` 用字符串拼接 SQL，不用参数化查询？
+
+```python
+# 我们的代码
+sql = f"SELECT * FROM {table_name} ..."
+```
+
+不是这样：
+```python
+# 想象的错误写法
+con.execute("SELECT * FROM ?", [table_name])
+```
+
+💡 **答案**：SQL 引擎**不允许**对 identifier（表名、列名）参数化，只允许对 value（值）参数化。这是**所有主流 SQL 引擎**（PostgreSQL / MySQL / DuckDB / SQLite）的共同设计。
+
+**为什么 SQL 这样设计？**
+- SQL 解析器先把 SQL 变成 AST → 再填参数
+- 如果允许 `FROM ?`，解析时不知道是哪张表 → AST 没法构造 → 后续优化（如索引选择）瘫痪
+- 所以参数化只能做"叶子节点"（具体的值），不能做结构性元素
+
+**能 / 不能参数化的位置**：
+| 位置 | 能 ? 吗 |
+|---|---|
+| `WHERE x = ?` | ✅ 能（值）|
+| `LIKE ?` | ✅ 能（值）|
+| `LIMIT ?` | ✅ 能（值）|
+| `FROM ?` | ❌ 不能（表名）|
+| `SELECT ?` | ❌ 不能（列名）|
+| `ORDER BY ? ASC` | ❌ 不能（列名）|
+| `ORDER BY x ?` | ❌ 不能（关键字 ASC/DESC）|
+
+🎯 **简化记忆**：**SQL 的"骨架"（结构）不能参数化，只有"骨架里塞的值"能参数化**。
+
+---
+
+### Q2：那必须字符串拼接，怎么防注入？
+
+💡 **答案**：**白名单 + 字符串拼接**。
+
+```python
+def describe_table(table_name: str) -> str:
+    valid_tables = _get_all_table_names()    # ← 拉合法表名列表
+    if table_name not in valid_tables:        # ← 白名单校验
+        return "[错误] 表不存在"
+    sql = f"SELECT * FROM {table_name}"      # ← 通过校验后才拼
+```
+
+**LLM 传 `"customers; DROP TABLE x"`**：
+- 在白名单里查 → 不存在
+- 直接 return 错误，**根本不会拼进 SQL**
+
+🎯 **白名单是 SQL 安全的通用模式**。任何需要"动态 identifier"的场景（动态表名、动态 ORDER BY 列）都用这套：
+```python
+ALLOWED_COLS = {"name", "age", "created_at"}
+if order_col not in ALLOWED_COLS:
+    raise ValueError("Invalid column")
+return f"SELECT * FROM users ORDER BY {order_col}"
+```
+
+---
+
+### Q3：`_get_all_table_names()` 每次调用都拉一次 information_schema，vs 启动时缓存一次，优劣？
+
+💡 **答案**：经典 cache 权衡题。
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| **静态缓存** | 0 ms 开销，性能好 | ⚠️ schema 变了不知道 |
+| **动态拉**（我们的）| ✅ 永远最新，正确性高 | ~5-10 ms / 次 |
+
+**量化**：单次查询本身要 100-500ms，动态拉的相对开销只占 5-10%，可接受。
+
+**生产环境最优解：带 TTL 的缓存**
+```python
+_cache = {"tables": None, "expires_at": 0.0}
+_TTL = 60   # 秒
+
+def _get_all_table_names():
+    now = time.time()
+    if _cache["tables"] and now < _cache["expires_at"]:
+        return _cache["tables"]
+    # ... 重新拉 ...
+    _cache["expires_at"] = now + _TTL
+```
+
+60s TTL 的效果：性能比纯动态好 60 倍，时效比纯静态好（最坏 60s 漂移）。
+
+🎯 **判断准则**：
+- 读多写少 + schema 稳定 + 性能敏感 → 静态缓存
+- 读写都有 + schema 可能变 + 正确性优先 → 动态拉
+- 中间态 → TTL 缓存
+
+---
+
+## Section B：输出格式 + 采样
+
+### Q4：为什么 `list_tables()` 返回 Markdown 字符串，不返回 `list[dict]`？
+
+💡 **答案**：**工具消费者是 LLM，不是程序员**。
+
+**3 方面优势**：
+1. **Token 效率**：list[dict] str 化约 280 tokens；Markdown 表格约 220 tokens（省 20-30%）
+2. **LLM 训练数据匹配**：模型在大量 Markdown 文档上训练过，对它"母语级理解"
+3. **信号密度**：Markdown 标题 / 表格让 LLM 有"视觉锚点"，能精准定位特定字段
+
+**反例（list[dict] str 化后 LLM 看到）**：
+```
+[{'name': 'customers', 'type': 'table', 'rows': 99441, ...}, {...}]
+```
+Python repr 风格、单引号、紧凑无格式、不易扫读。
+
+**正例（Markdown）**：
+```
+| 名称 | 类型 | 行数 | 业务说明 |
+|------|------|------|----------|
+| customers | 表 | 99,441 | 客户维度表... |
+```
+**真实可读的表格**，结构清晰。
+
+🎯 **设计原则**：**工具返回值的格式应该匹配消费者**。LLM 时代，工具应该返回"**结构化文档**"而不是"**结构化数据**"。
+
+---
+
+### Q5：`sample_rows` 为什么用 `USING SAMPLE 5 ROWS` 而不是 `LIMIT 5`？
+
+💡 **答案**：**LIMIT 5 是有偏切片，USING SAMPLE 是真随机**。
+
+**LIMIT 5（不带 ORDER BY）**：扫到 5 行就停 → 通常是"插入顺序最早的 5 条"
+
+```
+Olist 的 orders 表：
+LIMIT 5 → 全是 2016-09-04 上线第一周的订单
+       → 看不到"高峰期数据"或"分布全貌"
+       → LLM 误判数据集范围 / 时间跨度
+```
+
+**USING SAMPLE 5 ROWS**：横跨整个表的随机采样
+
+```
+返回:
+  2017-08-12 ...   ← 高峰期
+  2018-04-23 ...
+  2017-01-09 ...
+  2016-11-15 ...   ← 黑五前后
+  2018-09-01 ...
+```
+
+**LLM 真正"看见"数据全貌**。
+
+**DuckDB 的 USING SAMPLE 还有高级用法**：
+```sql
+USING SAMPLE 1%                          -- 百分比采样
+USING SAMPLE 1000 ROWS (system)          -- 系统采样（按页随机，更快）
+USING SAMPLE 5 ROWS (reservoir, 42)      -- 可重现的随机（带种子）
+```
+
+🎯 **设计核心**：**LLM 看到什么样的样本，决定它怎么写下游 SQL**。LIMIT 给的"早期切片"会让 LLM 产生系统性偏见。
+
+---
+
+## Part 6 总结：metadata_explorer 通关
+
+| 主题 | 核心 |
+|---|---|
+| **白名单防注入** | SQL 不允许 identifier 参数化 → 必须白名单 + 字符串拼接 |
+| **缓存权衡** | 静态快但 stale；动态正确但慢；TTL 缓存是工程最优 |
+| **输出格式** | LLM 是消费者，Markdown > list[dict]（token 省 + 训练数据匹配）|
+| **采样策略** | USING SAMPLE 防"早期切片偏斜"，比 LIMIT 更代表数据分布 |
+
+---
+
+# 全文总结：6 大 Part 的概念地图
+
+| Part | 主题 | 核心概念 |
+|---|---|---|
+| 1 | Reducer | Annotated + operator.add，覆盖 vs 累积 |
+| 2 | 正则 | `^\s*(--[^\n]*\n\s*)*(SELECT\|WITH)\b` 拆解 |
+| 3 | 多线程超时 | thread + join(timeout) + 邮箱 + daemon |
+| 4 | execute_sql | strip / LIMIT max+1 / try-finally / DTO |
+| 5 | Execution Memory | Bounded Context / DTO / Few-shot 正样本 / 不对称代价 |
+| 6 | metadata_explorer | 白名单 / TTL / Markdown 输出 / USING SAMPLE |
+
+每一章都对应**面试可讲的工程直觉 + 代码级踩坑经验**。
