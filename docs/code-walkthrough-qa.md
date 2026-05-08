@@ -1767,7 +1767,170 @@ analysis_results = [c for c in captures if c.success]
 
 ---
 
-# 全文总结：8 大 Part 概念地图
+# Part 9：prompts/ + agents/ 全景概览（对照表 + 模式型谱）
+
+> 这部分是"快速过"风格的概览，不是 Q&A。
+> 因为 prompts 的具体内容已经在各 Agent 的 Part 里讨论过，这里集中呈现"4 个 prompt 的共性"和"5 个 Agent 的型谱"。
+
+## prompts/ 目录的"通用 3 层结构"
+
+```
+prompts/
+├── query.py        # Query Agent
+├── planner.py      # Planner
+├── analysis.py     # Analysis Agent
+└── reporter.py     # Reporter
+```
+
+（**没** reviewer.py —— Reviewer 是逻辑节点，不调 LLM 综合）
+
+每个 prompt 都按 **3 层结构** 写：
+
+```
+Layer 1：角色 + 目标（Role）
+   "你是 SQL 专家 / 任务规划者 / 数据分析师 / 报告写手"
+
+Layer 2：工作协议（Protocol）
+   - 可用的工具
+   - ReAct 循环纪律
+   - 失败重试规则
+
+Layer 3：业务知识（Domain）
+   - Olist 数据集的 5 个坑
+   - 月度营收用哪个字段
+   - UV 怎么算
+   - 投资建议要看哪些维度
+```
+
+---
+
+## 4 个 prompt 的差异化对照
+
+| Prompt | 长度 | 工具部分 | 业务知识部分 | 输出格式 |
+|---|---|---|---|---|
+| **planner** | ~200 行 | 不调工具 | 业务术语 + few-shot 例子 | `list[ExecutionStep]`（结构化）|
+| **query** | ~180 行 | 4 个 metadata + execute 工具 | Olist 5 大坑 + SQL 方言 | 数据 + 自然语言总结 |
+| **analysis** | ~220 行 | 1 个 run_python 工具 | pandas/matplotlib 模板 + 图表保存约定 | 代码 + 图 |
+| **reporter** | ~150 行 | 不调工具 | 报告结构强制 + 写作纪律 | Markdown 结构化报告 |
+
+🎯 **关键观察**：每个 prompt 末尾有**"输出要求"或"写作纪律"段** —— 这是 prompt engineering 的"约束艺术"：
+```
+LLM 默认会发散 → 必须显式约束输出格式 → 才能拿到稳定结果
+```
+
+例子：
+- query.py: "数字要具体（不要写'营收很多'，写'YoY +23%'）"
+- reporter.py: "图表必须用 ![]() 嵌入"
+
+---
+
+## agents/ 目录：5 种 Agent 模式型谱
+
+```
+agents/
+├── planner.py      # 单次结构化输出
+├── query.py        # ReAct + 多工具
+├── analysis.py     # ReAct + 动态工具 + captures
+├── reporter.py     # 单次综合
+└── reviewer.py     # 逻辑节点（不是 LLM Agent）
+```
+
+### 5 个 Agent 全对照
+
+| Agent | 模式 | 调工具？ | LLM 调用次数 | 状态需求 | 输出 |
+|---|---|---|---|---|---|
+| **Planner** | `with_structured_output` | ❌ 无 | 1 次 | 无 | `list[ExecutionStep]` |
+| **Query** | `create_agent`（ReAct） | ✅ 4 个 | 多次循环 | 无（每次重建）| messages |
+| **Analysis** | `create_agent` + 工厂 | ✅ 1 个动态 | 多次循环 | **要 query_results + captures** | messages + 副作用文件 |
+| **Reporter** | 直接 `llm.invoke` | ❌ 无 | 1 次 | 完整 State | Markdown 字符串 |
+| **Reviewer** | **不调 LLM 综合** | ❌ 无 | 0-1 次（仅敏感性分类）| State.report_markdown | dict（status / approved）|
+
+---
+
+## 5 个 Agent 反映的 5 种"模式"
+
+```
+1. Planner = 「纯结构化输出」模式
+   适用：只需要文字输入，输出有固定结构
+   特征：1 次 LLM 调用，Pydantic 校验
+
+2. Query = 「经典 ReAct 循环」模式
+   适用：需要探查工具，行为不可预测
+   特征：多次 LLM 调用，工具调度
+
+3. Analysis = 「ReAct + 闭包工厂」模式
+   适用：ReAct 但需要 graph 上下文（state 数据）
+   特征：闭包注入 query_results + captures 收集结果
+
+4. Reporter = 「纯 LLM 综合」模式
+   适用：把多源数据综合成自然语言
+   特征：1 次 LLM 调用，State 序列化进 prompt
+
+5. Reviewer = 「逻辑节点」模式
+   适用：路由 / 判断 / 分类，不需要 LLM 综合
+   特征：interrupt() 是核心，不是 LLM 综合
+```
+
+**5 种模式 = LangGraph Agent 设计的"型谱"**。任何复杂 Agent 系统都是这 5 种的组合。
+
+---
+
+## 模式选择决策树
+
+```
+我要在图里加一个新节点 → 决策树：
+
+需要 LLM 输出文本？
+├─ 否 → 逻辑节点（如 reviewer / step_router）
+└─ 是 → ↓
+
+输出有强约束的结构？
+├─ 是 → with_structured_output（如 planner）
+└─ 否 → ↓
+
+需要调工具？
+├─ 否 → 直接 llm.invoke（如 reporter）
+└─ 是 → ↓
+
+工具需要 graph 上下文（state）？
+├─ 否 → create_agent（如 query）
+└─ 是 → 工厂 + 闭包 + create_agent（如 analysis）
+```
+
+---
+
+## build_xxx 函数的"4 段式"复用
+
+每个 `build_xxx` 工厂都按这个套路写：
+
+```python
+def build_xxx():
+    settings = get_settings()                    # [1] 加载配置
+    
+    llm = ChatOpenAI(model=..., temperature=0)    # [2] 创建 LLM 实例
+    
+    # [3] 创建专门的 LLM 行为
+    if Planner:        structured_llm = llm.with_structured_output(...)
+    if Query/Analysis: agent = create_agent(model=llm, tools=[...], ...)
+    if Reporter:       pass   # 直接用 llm
+    
+    def inner(...):                              # [4] 闭包内部行为
+        ...
+    return inner
+```
+
+🎯 **理解一个 build_xxx 函数 = 理解所有 5 个**。
+
+---
+
+## 一句话总结
+
+> **prompts/ 是 3 层 prompt 模板（角色 + 协议 + 知识）+ "输出约束" 的复用范本。**
+> **agents/ 是 5 种 Agent 模式（结构化输出 / ReAct / ReAct+闭包 / 纯综合 / 逻辑节点）的型谱。**
+
+---
+
+# 全文总结：9 大 Part 概念地图
 
 | Part | 主题 | 核心概念 |
 |---|---|---|
@@ -1779,6 +1942,7 @@ analysis_results = [c for c in captures if c.success]
 | 6 | metadata_explorer | 白名单 / TTL / Markdown 输出 / USING SAMPLE |
 | 7 | python_sandbox | subprocess 隔离 / PRELUDE / 跨进程通信 / Errors as Teachers |
 | 8 | lang_tools | Hexagonal Architecture / @tool 是 prompt / 闭包工厂模式 |
+| 9 | prompts + agents | 3 层 prompt 模板 / 5 种 Agent 模式型谱 / 决策树 |
 
 每一章都对应**面试可讲的工程直觉 + 代码级踩坑经验**。
 
