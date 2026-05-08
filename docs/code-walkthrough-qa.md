@@ -1238,7 +1238,263 @@ USING SAMPLE 5 ROWS (reservoir, 42)      -- 可重现的随机（带种子）
 
 ---
 
-# 全文总结：6 大 Part 的概念地图
+# Part 7：python_sandbox.py 走读（4 Section / 8 Q&A）
+
+> 这个文件比 metadata_explorer 难一档 —— 涉及**进程隔离 + 跨进程通信 + 输出捕获**三主题。
+
+## Section A：为什么是 subprocess
+
+### Q1：subprocess vs exec() 的安全差异？
+
+`exec(code)` 在主进程执行，5 类危险：
+1. **异常传染** —— LLM 代码崩 → 主进程跟着崩
+2. **变量污染** —— exec 共享命名空间，可改主进程变量
+3. **死循环卡死** —— 同步阻塞，没法 timeout
+4. **资源耗尽** —— OOM 后 OS 杀整个进程
+5. **全局状态污染** —— `sys.path` / `os.environ` 等被改
+
+🎯 **subprocess 的核心价值 = OS 进程边界**：独立内存 / 全局状态 / file descriptor / cwd。两进程**只能通过明确的通信渠道**（stdin/stdout/file/env）交互。
+
+---
+
+### Q2：subprocess 不保护什么？
+
+subprocess 是**进程级**隔离，不是**权限级**隔离。子进程仍然：
+- 用同一 uid（你的用户）
+- 用同一文件系统（能读你的 SSH key）
+- 用同一网络栈（能 HTTP 出去）
+
+**升级链路**：
+```
+Level 0: exec()                  ← 啥都不防
+Level 1: subprocess              ← 我们当前
+Level 2: + chroot                ← 文件系统视图
+Level 3: Docker container        ← 文件 + 网络 + cgroups
+Level 4: gVisor / Kata           ← 内核 syscall 隔离
+Level 5: VM (Firecracker)        ← 完全虚拟化
+Level 6: 跨主机 (E2B / Modal)     ← 物理隔离 + 云托管
+```
+
+🎯 **判定**：威胁模型决定升级时机。InsightPilot 单用户 demo → subprocess 够用；生产对外服务 → 必须 Docker。
+
+---
+
+## Section B：PRELUDE 注入模式
+
+### Q3：为什么要 SANDBOX_PRELUDE 前导脚本？
+
+防 5 个 LLM 高频 bug：
+1. **matplotlib 必崩**：没 `matplotlib.use("Agg")` → 无 GUI 沙盒里跑 plt.savefig 直接崩
+2. **pandas 截断**：没 `display.max_columns=None` → LLM 看到 `...` 误以为有更多列
+3. **数据加载路径**：LLM 不知道 INPUT_DATA_PATH 在哪，可能写 `pd.read_csv("data.csv")` 这种乱猜
+4. **嵌套结构**：query_results 是 list of dict（含 sql/columns/rows），LLM 容易写 `pd.DataFrame(query_results[0])` 错
+5. **Warning 噪声**：DeprecationWarning 污染 stdout
+
+🎯 **通用模式**：让"应该总是发生"的事情自动发生，不依赖调用方记得做（类似 Jupyter `%matplotlib inline`、Django shell_plus）。
+
+---
+
+### Q4：scipy / sklearn / seaborn 怎么办？三种策略组合
+
+```
+策略 1：Prompt 教 LLM 自取  ← 灵活，但可能漏
+策略 2：PRELUDE 全 import   ← 启动慢，PRELUDE 臃肿
+策略 3：Lazy auto-import    ← 高级，行为有"魔法感"
+```
+
+🎯 **生产实战**：组合用
+- PRELUDE 预 import 高频（pandas / matplotlib）
+- Prompt 教 LLM 长尾包按需 import
+- Sandbox 环境**预装好候选包**（不然 import 也失败）
+- 极致：Docker image 预装"标准数据分析栈"
+
+---
+
+## Section C：跨进程数据传递
+
+### Q5：JSON 文件 + env var 比 stdin pipe 强在哪？
+
+3 个理由：
+
+1. **数据大小**：OS pipe buffer 默认 64KB，超过就死锁
+2. **调试便利**：input.json 留磁盘可手工 cat 看
+3. **管道死锁陷阱**（最深层）：
+   ```
+   父进程 write 到 stdin（buffer 满，阻塞）
+   子进程刚启动，import pandas 中（耗时 ~500ms）
+   子还没读 stdin
+   → 死锁
+   ```
+   Python `subprocess` 文档明确警告。
+
+🎯 **代码品味分水岭**：senior 知道 pipe buffer 限制和死锁陷阱，**默认写文件**；junior 用 stdin pipe，"反正小数据测试通过了"。
+
+---
+
+### Q6：为什么 input 文件删但 chart 文件留？
+
+**Transient input vs persistent output**：
+- input 是数据传输的 carrier，跑完即删（state["query_results"] 还有副本）
+- chart 是用户最终交付物，Reporter 报告里要 `![]()` 引用
+
+🎯 **通用模式**：CI/CD 构建产物 vs 缓存依赖、MapReduce shuffle vs 输出、ETL 临时表 vs 结果表 —— **看是否有下游消费者**。
+
+实现细节用 `try/except FileNotFoundError`（EAFP 风格防 race condition）。
+
+---
+
+## Section D：输出捕获与错误处理
+
+### Q7：为什么用集合差集检测新生成图表，不让 LLM 自报？
+
+LLM 自报有 5 种"谎言"方式：
+1. **完全编造** —— 说生成了实际没写 savefig
+2. **忘 savefig** —— 用了 plt.show()（沙盒无 GUI 不工作）
+3. **savefig 静默失败** —— 磁盘满 / 权限 / 文件名非法
+4. **plt.close() 太早** —— 文件存在但内容空
+5. **保存到错误路径** —— /tmp/xxx 我们扫不到
+
+集合差集 `files_after - files_before` **统一防御所有这些**：
+- 不读 LLM 说什么
+- 扫**文件系统的实际变化**
+
+🎯 **通用准则 "Verify Behavior, Not Declarations"**：
+- 测试：assert 实际行为，不信 test 名字
+- 安全：检查 ACL，不信用户声明
+- 监控：测真实指标，不信 SLA 文档
+- 分布式：health check 节点，不信状态消息
+
+---
+
+### Q8：SQL 错误分类器和 Python 错误分类器为什么对称设计？
+
+两者都做同一件事：
+
+```
+原始异常 → 按类型分类 → 翻译成"消费者语言" → + 具体修复建议
+```
+
+🎯 **反映通用原则 "Errors as Teachers"**：
+
+| 默认错误 | 教程式错误 |
+|---|---|
+| `ValueError: could not convert string to float: 'abc'` | "类型转换失败...修复建议：用 pd.to_numeric(x, errors='coerce')" |
+| LLM 看不懂 → 盲目重试 | LLM 看到具体 next action → 一次修复 |
+
+**对 ReAct Agent 至关重要**：
+```
+Thought → Action → Observation → Thought ...
+                          ↑
+              "观察"质量决定后续质量
+```
+
+**好工具用错误教用户成长，烂工具用错误惩罚用户**。Rust 编译器是这条原则的极致代表。
+
+🎯 **paper 启发**：可设计实验测试 "Error Quality Effect"：
+- Group A: Agent 收原始异常
+- Group B: Agent 收教程式错误
+- 测重试成功率差异 → 5-20%（实证可发 paper）
+
+---
+
+## Part 7 总结
+
+| Section | 核心 |
+|---|---|
+| A. **subprocess 选择** | 防 5 类问题（异常 / 变量 / 死循环 / OOM / 全局状态）；不防文件 / 网络 / 同 uid |
+| B. **PRELUDE 注入** | 防 5 个 LLM 高频 bug；包管理三策略组合 |
+| C. **跨进程数据传递** | JSON 文件 + env var > stdin pipe（pipe 死锁陷阱）；transient input vs persistent output |
+| D. **输出捕获** | "Verify behavior, not declarations"；"Errors as Teachers" |
+
+---
+
+# 通用工程 vs Agent 专有知识分类
+
+> 这份笔记 70+ 个概念里，**70% 是通用工程**（任何项目都能用），**30% 是 Agent 专有**（LLM 时代新范式）。
+
+## 🟢 通用工程知识（永远值钱）
+
+### 系统设计 / 架构
+- Bounded Context（不同生命周期用不同存储）
+- DTO 模式（双向，跨边界 dict / 内层富对象）
+- Hexagonal Architecture（内层业务，外层适配）
+- 节点 / 服务粒度（高内聚 + 无依赖）
+- Single Source of Truth（默认值集中定义）
+
+### 数据 / 数据库
+- SQL identifier vs value 参数化
+- 白名单 + 字符串拼接（防注入）
+- TTL 缓存权衡
+- LIMIT max+1 边界探测
+- USING SAMPLE vs LIMIT
+- transient input vs persistent output
+
+### 安全 / 防御
+- 纵深防御（多层）
+- 正则白名单
+- subprocess 进程边界
+- subprocess 限制（文件 / 网络 / uid）
+- Best-effort side-effect
+
+### 并发 / 多线程
+- thread.join(timeout=N)
+- 跨线程异常不传播
+- daemon=True
+- try / except / finally
+- EAFP 风格
+
+### 进程间通信
+- subprocess pipe 死锁
+- 文件 + env var 传数据
+
+### 算法 / 工程心智
+- Sort fusion / RRF
+- 不对称代价 → 不对称响应
+- YAGNI / KISS / EAFP vs LBYL
+- 频率匹配数据变化速率
+
+## 🔵 Agent 专有知识（这一波风口）
+
+### LangGraph 特定
+- Annotated + operator.add reducer
+- add_messages 智能 reducer
+- TypedDict 作为 State
+- Checkpointer + interrupt()
+- Conditional edges
+
+### Few-shot / RAG
+- Few-shot 正样本语义
+- 检索式 in-context learning
+- 质量评分加权 retrieval
+
+### LLM 工具设计
+- PRELUDE 注入模式
+- Markdown 为 LLM 优化
+- list[dict] 给 LLM 看
+- Errors as Teachers
+- Verify behavior, not declarations
+
+### Agent 评估
+- Round-trip filtering
+- Asymmetric metrics（FP vs FN）
+
+## 关键洞察
+
+**Agent 专有知识 ≠ 独立**，几乎都是"通用知识 + 一点 LLM 特异性"组合而成：
+
+```
+PRELUDE 注入   = 子进程执行（通用）+ 防 LLM 漏掉（LLM 特异）
+Errors as Teachers = 错误信息分层（通用）+ ReAct 循环（LLM 特异）
+DTO 跨边界    = 序列化（通用）+ LangGraph state（LLM 特异）
+```
+
+🎯 **senior 工程师转 AI 比 junior 容易**，因为 70% 通用工程是地基。**没有地基，30% Agent 知识也搭不稳**。
+
+5 年后 LLM 范式可能变，但通用工程那 70% **永远值钱**。
+
+---
+
+# 全文总结：7 大 Part 概念地图
 
 | Part | 主题 | 核心概念 |
 |---|---|---|
@@ -1248,5 +1504,6 @@ USING SAMPLE 5 ROWS (reservoir, 42)      -- 可重现的随机（带种子）
 | 4 | execute_sql | strip / LIMIT max+1 / try-finally / DTO |
 | 5 | Execution Memory | Bounded Context / DTO / Few-shot 正样本 / 不对称代价 |
 | 6 | metadata_explorer | 白名单 / TTL / Markdown 输出 / USING SAMPLE |
+| 7 | python_sandbox | subprocess 隔离 / PRELUDE / 跨进程通信 / Errors as Teachers |
 
 每一章都对应**面试可讲的工程直觉 + 代码级踩坑经验**。
