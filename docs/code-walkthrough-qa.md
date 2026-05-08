@@ -1494,7 +1494,280 @@ DTO 跨边界    = 序列化（通用）+ LangGraph state（LLM 特异）
 
 ---
 
-# 全文总结：7 大 Part 概念地图
+# Part 8：lang_tools.py 走读（3 Section / 6 Q&A）
+
+> 这个文件是 InsightPilot 的"适配层" —— 把核心工具包装成 LangChain @tool 给 Agent 用。
+> 短小但密度高：**Hexagonal Architecture / @tool 魔法 / 闭包工厂模式** 三个核心概念。
+
+## Section A：适配层为什么存在
+
+### Q1：为什么不直接在 duckdb_executor.py 上加 @tool 装饰器？
+
+3 层"为什么"递进：
+
+**表层**：格式转换
+- 核心 execute_sql 返回 QueryResult dataclass
+- @tool 包装版返回 string
+- 这层做了 `result.to_llm_string()` 转换
+
+**中层**：framework decoupling
+- @tool 在核心 → 核心代码依赖 langchain_core
+- 没装 langchain 的环境（CLI / 单元测试 / 纯 SQL 脚本）import 不动
+- LangChain 改 API（历史改过 5+ 次） → 核心代码跟着改
+
+**底层**：**核心代码应该比框架活得更长**
+- 框架（LangChain / LlamaIndex / AutoGen）寿命：1-3 年
+- 业务逻辑（SQL 执行 / 安全防御）寿命：永远
+- → 业务不应依赖某个特定框架
+
+🎯 **Hexagonal Architecture / Ports and Adapters 模式**：
+- 内层（Domain）：业务逻辑，不依赖外部框架
+- 外层（Adapter）：把外部框架适配到 ports
+- 框架：可替换的"插件"
+
+**真实收益**：
+- LangChain 改 API → 只改 lang_tools.py
+- 想换 LlamaIndex → 加一个 llamaindex_tools.py，核心零改动
+- 单元测试 → 不用装 LangChain
+
+---
+
+### Q2：什么时候适配层是"过度设计"？
+
+**判定矩阵**：
+```
+                    框架稳定          框架不稳定
+项目短期/抛弃式      ❌ 不要适配层    ❌ 不要适配层
+项目长期/重要        ⚠️ 看情况        ✅ 一定要
+```
+
+**过度设计的具体场景**：
+- 黑客松 / 一次性脚本 / Jupyter notebook / PoC
+- 单人 + 不开源 + "第二个使用者"永远不出现
+
+**值得做的具体场景**：
+- 生产服务、开源库、长期项目（>1 年）
+- 框架本身不稳定（**LangChain 就是！**）
+- 跨团队代码 / 作品集
+
+🎯 **判定准则 "第二用户"**：
+- 第一个用户 = 你自己（关心开发速度）
+- 第二个用户 = 别人 / 未来的你（关心接口稳定）
+- **只要"第二个用户可能出现"，就该考虑加适配层**
+
+🎯 **YAGNI vs Hexagonal**：判断变化的概率 × 不抽象时的修改成本 vs 抽象层的维护成本。
+LangChain 改 API 概率 ≈ 100% → 适配层稳赚不赔。
+
+---
+
+## Section B：@tool 装饰器的"魔法"
+
+### Q3：@tool 装饰一个函数，LLM 实际看到的是什么？
+
+LLM 不直接调 Python 函数，通过 OpenAI **function calling API** 交互。@tool 自动生成 **JSON schema**：
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "describe_table",
+    "description": "(完整 docstring)",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "table_name": {
+          "type": "string",
+          "description": "(from docstring Args)"
+        }
+      },
+      "required": ["table_name"]
+    }
+  }
+}
+```
+
+**@tool 自动从函数提取**：
+| 函数元素 | → schema 的什么 |
+|---|---|
+| 函数名 | `function.name` |
+| docstring 全部 | `function.description` |
+| 参数 + 类型注解 | `properties.{name}.type` |
+| docstring `Args` 段 | `properties.{name}.description` |
+| 没默认值的参数 | `required` 列表 |
+
+🎯 **完整 Agent 对话流程**：
+```
+1. 启动：LangChain 把所有工具 schema 塞进 OpenAI tools 参数
+2. 第一次 LLM 调用：LLM 看到工具菜单
+3. LLM 输出 tool_calls：决定调哪个工具
+4. LangChain 解析 → 调真实函数 → 拿结果
+5. 第二次 LLM 调用：把结果作为 ToolMessage 塞回对话历史
+6. LLM 继续思考 / 调下一个工具 / 给最终答案
+```
+
+**关键**：LLM 没"读你的源码"，只通过 schema 认识你的工具。
+
+---
+
+### Q4：docstring 写得好坏对 Agent 行为有多大影响？
+
+3 种"docstring 不好"的影响：
+1. **工具选择混乱**：list_tables / describe_table / sample_rows 名字相似 → LLM 全调一遍 / 选错 / 跳过
+2. **输出形态不清楚**：LLM 不知道返回 list 还是字符串 → 下游 Action 错乱
+3. **触发时机模糊**：LLM 在每个 ReAct 循环都重复调 → 死循环风险
+
+**研究数据（Gorilla / ToolBench 等）**：
+| docstring 质量 | tool selection accuracy |
+|---|---|
+| 最差（一句话）| ~50-60% |
+| 中等（含参数说明）| ~70-80% |
+| **最佳（4 段式）** | **85-95%** |
+
+**多写 100 tokens，准确率提升 30%+** —— LLM agent 工程里**最高 ROI 的优化**。
+
+🎯 **4 段式模板**：
+```
+[1] 一句话功能（What it does）
+[2] 何时使用（When to use）  ← 解决工具选择混乱
+[3] 返回（What it returns）   ← 解决下游消费
+[4] Args 参数说明              ← 解决调用错误
+```
+
+🎯 **意识转变**：
+```
+传统 docstring：写给"5 年后的程序员"看
+LLM 时代 docstring：写给"运行时的 LLM"看
+→ docstring = 硬代码，不是软文档
+```
+
+---
+
+## Section C：静态 vs 动态工具的设计选择
+
+### Q5：闭包 + 工厂模式 —— execute_sql 静态、run_python 工厂的本质
+
+**闭包基础**（用最简单的例子）：
+
+```python
+def make_multiplier(factor):       # 外层函数
+    def multiply(x):                # 内层函数
+        return x * factor           # ← 用了外层 factor
+    return multiply
+
+times_3 = make_multiplier(3)
+times_5 = make_multiplier(5)
+
+times_3(10)   # 30，因为 times_3 "记住了" factor=3
+times_5(10)   # 50，因为 times_5 "记住了" factor=5
+```
+
+**闭包 = 一个函数 + 它"记住的"外部变量**。
+两个函数代码一样，但记住的 factor 不同。
+
+---
+
+**两个工具的差异不是功能不同，是"运行时需要的状态"不同**：
+
+```
+execute_sql 运行时需要：
+  - sql 字符串（LLM 当前调用传入）
+  - DuckDB 连接（每次现开）
+  → 无状态（stateless）
+
+run_python 运行时需要：
+  - code 字符串（LLM 当前调用传入）
+  - sandbox 环境（subprocess 现开）
+  - query_results（前序节点跑出的数据！）  ← 状态！
+  → 有状态（stateful）
+```
+
+**run_python 的 query_results 不能让 LLM 传**：
+- 数据可能 100KB+ → token 爆炸
+- LLM 不需要看这数据来决定调谁
+- 数据复制可能损坏
+
+---
+
+**三种方案对比**：
+| 方案 | 评价 |
+|---|---|
+| LLM 当参数传 | ❌ token 爆炸、可能损坏 |
+| 全局变量 | ❌ 不可重入、并发会冲突 |
+| **闭包工厂** | ✅ 每次构建独立实例、并发安全 |
+
+```python
+def make_run_python_tool(query_results, captures):
+    @tool
+    def run_python(code, step_id):
+        # 闭包：能访问外层的 query_results 和 captures
+        sandbox_input = SandboxInput(
+            code=code,
+            query_results=query_results,   # ← 闭包记住的，LLM 不知道
+        )
+        ...
+    return run_python
+```
+
+🎯 **判定准则**：**工具需要"调用时刻无关的"上下文 → 必须工厂**。
+
+---
+
+### Q6：captures 是什么？为什么解决了 chart_paths bug？
+
+**背景问题**：LangChain 工具必须返回字符串给 LLM，但 graph 层需要结构化的 AnalysisResult（含 chart_paths / code / stdout）。
+
+**曾经的方案（有 bug）：事后从 messages 重跑**
+```python
+for msg in messages:
+    if msg.tool_call.name == "run_python":
+        code = msg.tool_call.args["code"]
+        result = execute_python(SandboxInput(code=code, ...))   # 重跑
+```
+
+**致命 bug**：
+```
+第一次跑（agent.invoke 内部）：
+   生成 chart.png → chart_paths 检测：[chart.png] ✓
+
+第二次跑（事后重跑）：
+   savefig("chart.png") 覆盖文件
+   files_after - files_before = []  ← 文件已存在，不算"新增"！
+```
+
+**修复方案：captures（在工具调用源头捕获）**
+
+```python
+captures: list = []
+agent = build_analysis_agent(qr, captures=captures)
+                                  ↓ 闭包捕获 captures
+agent.invoke(...)
+   ↓ LLM 调 run_python：
+   工具内部 captures.append(result)   # ← 直接写到外面的 list
+
+# 跑完后
+analysis_results = [c for c in captures if c.success]
+```
+
+**关键 trick**：`captures` 是 mutable list（可变对象），闭包记住的是 list 的**引用**。工具内部 append → 外面看到同一个 list 变长。
+
+🎯 **这个 pattern 的名字**：**Result Collector via Closure**
+- 适用：工具有副作用（生成文件 / 改数据库），不能事后重跑
+- 适用：工具返回值是简化版，需要保留完整版给上层
+- **don't do work twice** 的工程美学
+
+---
+
+## Part 8 总结
+
+| Section | 核心 |
+|---|---|
+| A. 适配层为什么存在 | Hexagonal Architecture / 业务逻辑比框架活得长 / "第二用户"判定 |
+| B. @tool 魔法 | docstring 是 prompt（运行时 LLM 看的 JSON schema）；4 段式模板影响 30%+ accuracy |
+| C. 静态 vs 动态工具 | 闭包基础（多 factor multiplier 类比）+ Result Collector via Closure 模式 |
+
+---
+
+# 全文总结：8 大 Part 概念地图
 
 | Part | 主题 | 核心概念 |
 |---|---|---|
@@ -1505,5 +1778,24 @@ DTO 跨边界    = 序列化（通用）+ LangGraph state（LLM 特异）
 | 5 | Execution Memory | Bounded Context / DTO / Few-shot 正样本 / 不对称代价 |
 | 6 | metadata_explorer | 白名单 / TTL / Markdown 输出 / USING SAMPLE |
 | 7 | python_sandbox | subprocess 隔离 / PRELUDE / 跨进程通信 / Errors as Teachers |
+| 8 | lang_tools | Hexagonal Architecture / @tool 是 prompt / 闭包工厂模式 |
 
 每一章都对应**面试可讲的工程直觉 + 代码级踩坑经验**。
+
+---
+
+# 跨 Part 的"通用基础概念"
+
+读完 8 个 Part 后，你会发现一些概念**反复出现**，这些是"工程通用语言"：
+
+| 概念 | 出现的 Part | 说明 |
+|---|---|---|
+| **闭包**（closure） | Part 5, 8 | 函数 + 它记住的环境 |
+| **DTO 模式** | Part 4, 5, 8 | 跨边界用 dict / 模块内用富对象 |
+| **Hexagonal Architecture** | Part 5, 8 | 内层业务、外层适配 |
+| **Best-effort side-effect** | Part 5, 7 | 周边失败不害死核心 |
+| **EAFP vs LBYL** | Part 4, 7 | Python 异常驱动 vs 预查 |
+| **Verify behavior, not declarations** | Part 7, 8 | 测真实结果，不信声明 |
+| **不对称代价 → 不对称响应** | Part 5 | 刹车比油门重 |
+
+理解这 7 个概念 = 理解所有 8 个 Part 的**70% 通用工程**。剩下 30% 是 LangGraph / LangChain 的特异性（reducer / Annotated / @tool / interrupt 等）。
